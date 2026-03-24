@@ -1,0 +1,14 @@
+*.pt
+*.pyc
+*.pyo
+*.pyd
+*.npy
+*.png
+*.json
+*.csv
+*.svs
+*.tif
+*.tsv
+*.pkl
+*.gz
+*.zip
