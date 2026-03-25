@@ -8,7 +8,8 @@ CROP_SIZE = 224
 PROJECTION_DIM = 256
 DROPOUT = 0.1
 IMAGE_EMBED_DIM = 2048
-MODEL_NAME = "resnet50"
+MODEL_NAME = "uni"
+IMAGE_ENCODER_CHECKPOINT = "/data/yujk/UNI2-h/pytorch_model.bin"
 
 CONTROL_FEATURE_PREFIXES = (
     "NegControlProbe_",

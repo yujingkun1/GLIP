@@ -7,7 +7,6 @@ import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
-import anndata as ad
 import numpy as np
 import openslide
 import pandas as pd
@@ -57,19 +56,37 @@ def is_control_feature(feature_name: str) -> bool:
     return any(feature_name.startswith(prefix) for prefix in CFG.CONTROL_FEATURE_PREFIXES)
 
 
+def _load_gene_names_from_h5ad(h5ad_path: str) -> List[str]:
+    import anndata as ad
+
+    adata = ad.read_h5ad(h5ad_path, backed="r")
+    try:
+        return [str(gene_name) for gene_name in adata.var_names]
+    finally:
+        if getattr(adata, "file", None) is not None:
+            adata.file.close()
+
+
 def resolve_gene_panel(
     hest_data_dir: str,
     sample_id: str,
     remove_control_features: bool,
 ) -> List[str]:
     h5ad_path = os.path.join(hest_data_dir, "st", f"{sample_id}.h5ad")
+    transcripts_path = os.path.join(hest_data_dir, "transcripts", f"{sample_id}_transcripts.parquet")
+
+    gene_names = None
     if os.path.exists(h5ad_path):
-        adata = ad.read_h5ad(h5ad_path, backed="r")
-        gene_names = [str(gene_name) for gene_name in adata.var_names]
-        if getattr(adata, "file", None) is not None:
-            adata.file.close()
-    else:
-        transcripts_path = os.path.join(hest_data_dir, "transcripts", f"{sample_id}_transcripts.parquet")
+        try:
+            gene_names = _load_gene_names_from_h5ad(h5ad_path)
+        except Exception as exc:
+            if not os.path.exists(transcripts_path):
+                raise RuntimeError(
+                    f"Failed to read gene names from {h5ad_path} and no transcript parquet fallback exists at {transcripts_path}"
+                ) from exc
+            print(f"Warning: failed to read {h5ad_path} via anndata ({exc}); falling back to transcript parquet.")
+
+    if gene_names is None:
         parquet_file = pq.ParquetFile(transcripts_path)
         gene_names = []
         seen = set()

@@ -15,7 +15,7 @@ from tqdm import tqdm
 
 from glip import config as CFG
 from glip.data import XeniumSingleCellDataset, prepare_processed_dataset
-from glip.model import ContrastiveImageGeneModel
+from glip.model import ContrastiveImageGeneModel, resolve_image_model_name
 from glip.utils import (
     AvgMeter,
     compute_pearson_metrics,
@@ -180,6 +180,17 @@ def evaluate_retrieval(
     return metrics
 
 
+def configure_hf_hub(args: argparse.Namespace) -> None:
+    if args.hf_endpoint:
+        os.environ["HF_ENDPOINT"] = args.hf_endpoint
+
+    if args.hf_hub_download_timeout and args.hf_hub_download_timeout > 0:
+        os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = str(int(args.hf_hub_download_timeout))
+
+    if args.hf_hub_etag_timeout and args.hf_hub_etag_timeout > 0:
+        os.environ["HF_HUB_ETAG_TIMEOUT"] = str(int(args.hf_hub_etag_timeout))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train GLIP on NCBI784 single-cell Xenium data")
     parser.add_argument(
@@ -189,7 +200,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--processed-dir", default="/data/yujk/GLIP/processed", help="Processed cache directory")
     parser.add_argument("--sample-id", default="NCBI784", help="HEST Xenium sample id")
-    parser.add_argument("--run-dir", default="/data/yujk/GLIP/runs/ncbi784_default", help="Training output directory")
+    parser.add_argument("--run-dir", default="/data/yujk/GLIP/runs/ncbi784_uni", help="Training output directory")
     parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, default=64, help="Training batch size")
     parser.add_argument("--eval-batch-size", type=int, default=128, help="Evaluation batch size")
@@ -197,7 +208,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=CFG.LR, help="Learning rate")
     parser.add_argument("--weight-decay", type=float, default=CFG.WEIGHT_DECAY, help="AdamW weight decay")
     parser.add_argument("--temperature", type=float, default=CFG.TEMPERATURE, help="Contrastive temperature")
-    parser.add_argument("--pretrained", default="true", help="Use ImageNet-pretrained ResNet50")
+    parser.add_argument("--model", default=CFG.MODEL_NAME, help="Image encoder backbone, e.g. resnet50 or uni")
+    parser.add_argument("--pretrained", default="true", help="Use pretrained image encoder weights when available")
+    parser.add_argument(
+        "--image-encoder-checkpoint",
+        default=CFG.IMAGE_ENCODER_CHECKPOINT,
+        help="Optional local image encoder checkpoint path",
+    )
+    parser.add_argument("--hf-endpoint", default="", help="Optional Hugging Face Hub endpoint, e.g. https://hf-mirror.com")
+    parser.add_argument("--hf-hub-download-timeout", type=int, default=0, help="Optional HF Hub download timeout in seconds")
+    parser.add_argument("--hf-hub-etag-timeout", type=int, default=0, help="Optional HF Hub metadata timeout in seconds")
     parser.add_argument("--device", default="", help="Torch device, empty means auto")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--crop-size", type=int, default=CFG.CROP_SIZE, help="Crop size in level-0 pixels")
@@ -248,11 +268,32 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    args.pretrained = parse_bool(args.pretrained)
+    args.model = args.model.strip()
+    args.resolved_model_name = resolve_image_model_name(args.model)
+    args.hf_endpoint = args.hf_endpoint.strip()
+    args.image_encoder_checkpoint = os.path.expanduser(args.image_encoder_checkpoint.strip()) if args.image_encoder_checkpoint else ""
+    configure_hf_hub(args)
+
+    if args.image_encoder_checkpoint and not os.path.exists(args.image_encoder_checkpoint):
+        raise FileNotFoundError(f"Local image encoder checkpoint not found: {args.image_encoder_checkpoint}")
+
+    if args.image_encoder_checkpoint and args.pretrained:
+        print("Local image encoder checkpoint provided; disabling remote pretrained download.")
+        args.pretrained = False
+
     os.makedirs(args.run_dir, exist_ok=True)
     seed_everything(args.seed)
 
     device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    print(f"Image encoder: {args.resolved_model_name}")
+    if args.hf_endpoint:
+        print(f"Using HF endpoint: {args.hf_endpoint}")
+    if args.hf_hub_download_timeout and args.hf_hub_download_timeout > 0:
+        print(f"HF_HUB_DOWNLOAD_TIMEOUT={args.hf_hub_download_timeout}")
+    if args.hf_hub_etag_timeout and args.hf_hub_etag_timeout > 0:
+        print(f"HF_HUB_ETAG_TIMEOUT={args.hf_hub_etag_timeout}")
 
     prepare_processed_dataset(
         hest_data_dir=args.hest_data_dir,
@@ -325,7 +366,9 @@ def main() -> None:
     train_loader = create_loader(train_dataset, args.batch_size, args.num_workers, shuffle=True)
     model = ContrastiveImageGeneModel(
         gene_dim=train_dataset.num_features,
-        pretrained=parse_bool(args.pretrained),
+        model_name=args.resolved_model_name,
+        pretrained=args.pretrained,
+        image_encoder_checkpoint=args.image_encoder_checkpoint,
         temperature=args.temperature,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -453,6 +496,13 @@ def main() -> None:
         "train_cells": int(len(train_dataset)),
         "test_cells": int(len(test_dataset)),
         "num_genes": int(train_dataset.num_features),
+        "model": args.model,
+        "resolved_model_name": args.resolved_model_name,
+        "pretrained": bool(args.pretrained),
+        "image_encoder_checkpoint": args.image_encoder_checkpoint or None,
+        "hf_endpoint": args.hf_endpoint or None,
+        "hf_hub_download_timeout": int(args.hf_hub_download_timeout),
+        "hf_hub_etag_timeout": int(args.hf_hub_etag_timeout),
         "test_fold": int(args.test_fold),
         "num_position_folds": int(args.num_position_folds),
         "max_train_cells": int(args.max_train_cells),
