@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import importlib
+import math
+import os
+import sys
 from typing import Tuple
 
 import torch
@@ -184,6 +187,112 @@ def soft_cross_entropy(predictions: torch.Tensor, targets: torch.Tensor) -> torc
     return (-targets * log_softmax(predictions)).sum(dim=1)
 
 
+def _resolve_scfoundation_module(repo_dir: str):
+    model_dir = os.path.join(os.path.abspath(repo_dir), "model")
+    if not os.path.isdir(model_dir):
+        raise FileNotFoundError(f"scFoundation model directory not found: {model_dir}")
+    if model_dir not in sys.path:
+        sys.path.insert(0, model_dir)
+    try:
+        from load import convertconfig, gatherData  # type: ignore
+        from pretrainmodels.select_model import select_model  # type: ignore
+    except ModuleNotFoundError as exc:
+        missing_name = getattr(exc, "name", str(exc))
+        raise RuntimeError(
+            "scFoundation dependencies are incomplete. "
+            f"Missing module: {missing_name}. Install the required packages, especially local_attention."
+        ) from exc
+    return convertconfig, gatherData, select_model
+
+
+class ScFoundationGeneBackbone(nn.Module):
+    def __init__(
+        self,
+        *,
+        repo_dir: str,
+        checkpoint_path: str,
+        checkpoint_key: str = CFG.SCFOUNDATION_KEY,
+        pool_type: str = CFG.SCFOUNDATION_POOL_TYPE,
+        tgthighres: str = CFG.SCFOUNDATION_TGTHIGHRES,
+    ) -> None:
+        super().__init__()
+        convertconfig, gather_data_fn, select_model = _resolve_scfoundation_module(repo_dir)
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        if checkpoint_key not in checkpoint:
+            raise KeyError(f"scFoundation checkpoint key not found: {checkpoint_key}")
+
+        model_data = convertconfig(checkpoint[checkpoint_key])
+        config = model_data["config"]
+        if "qv_dim" not in config:
+            if config.get("model") != "mae_autobin":
+                if "dim_head" in config:
+                    config["qv_dim"] = config["dim_head"]
+                else:
+                    config["qv_dim"] = 64
+        if "ppi_edge" not in config:
+            config["ppi_edge"] = None
+
+        model = select_model(config)
+        model.load_state_dict(model_data["model_state_dict"])
+
+        self.token_emb = model.token_emb
+        self.pos_emb = model.pos_emb
+        self.encoder = model.encoder
+        self.config = config
+        self.gather_data = gather_data_fn
+        self.pool_type = str(pool_type).strip().lower()
+        self.tgthighres = str(tgthighres).strip().lower()
+        hidden_dim = int(config["encoder"]["hidden_dim"])
+        self.output_dim = hidden_dim * 4 if self.pool_type == "all" else hidden_dim
+
+    def _build_resolution_tokens(self, total_count: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        safe_total = total_count.clamp_min(1.0)
+        source_token = torch.log10(safe_total)
+        if not self.tgthighres:
+            target_token = source_token
+        elif self.tgthighres.startswith("f"):
+            target_token = torch.log10(safe_total * float(self.tgthighres[1:]))
+        elif self.tgthighres.startswith("a"):
+            target_token = source_token + float(self.tgthighres[1:])
+        elif self.tgthighres.startswith("t"):
+            target_token = torch.full_like(source_token, float(self.tgthighres[1:]))
+        else:
+            raise ValueError("scFoundation tgthighres must start with f, a, or t")
+        return target_token, source_token
+
+    def forward(self, expressions: torch.Tensor) -> torch.Tensor:
+        expressions = expressions.float().clamp_min(0.0)
+        total_count = expressions.sum(dim=1, keepdim=True)
+        normalized = torch.where(
+            total_count > 0,
+            torch.log1p(expressions / total_count.clamp_min(1e-6) * 1e4),
+            torch.zeros_like(expressions),
+        )
+        target_token, source_token = self._build_resolution_tokens(total_count)
+        model_input = torch.cat([normalized, target_token, source_token], dim=1)
+
+        data_gene_ids = torch.arange(model_input.shape[1], device=model_input.device).unsqueeze(0).expand(model_input.shape[0], -1)
+        value_labels = model_input > 0
+        gathered_values, padding_labels = self.gather_data(model_input, value_labels, self.config["pad_token_id"])
+        position_gene_ids, _ = self.gather_data(data_gene_ids, value_labels, self.config["pad_token_id"])
+
+        token_embeddings = self.token_emb(gathered_values.unsqueeze(2).float(), output_weight=0)
+        token_embeddings = token_embeddings + self.pos_emb(position_gene_ids)
+        encoded = self.encoder(token_embeddings, padding_labels)
+
+        if self.pool_type == "max":
+            pooled, _ = torch.max(encoded, dim=1)
+            return pooled
+        if self.pool_type != "all":
+            raise ValueError("scFoundation pool_type must be one of: all, max")
+
+        token_target = encoded[:, -1, :]
+        token_source = encoded[:, -2, :]
+        token_max, _ = torch.max(encoded[:, :-2, :], dim=1)
+        token_mean = torch.mean(encoded[:, :-2, :], dim=1)
+        return torch.cat([token_target, token_source, token_max, token_mean], dim=1)
+
+
 class ContrastiveImageGeneModel(nn.Module):
     def __init__(
         self,
@@ -193,6 +302,12 @@ class ContrastiveImageGeneModel(nn.Module):
         pretrained: bool = True,
         image_encoder_checkpoint: str = CFG.IMAGE_ENCODER_CHECKPOINT,
         temperature: float = CFG.TEMPERATURE,
+        gene_encoder: str = CFG.GENE_ENCODER,
+        scfoundation_repo_dir: str = CFG.SCFOUNDATION_REPO_DIR,
+        scfoundation_checkpoint: str = CFG.SCFOUNDATION_CHECKPOINT,
+        scfoundation_key: str = CFG.SCFOUNDATION_KEY,
+        scfoundation_pool_type: str = CFG.SCFOUNDATION_POOL_TYPE,
+        scfoundation_tgthighres: str = CFG.SCFOUNDATION_TGTHIGHRES,
     ) -> None:
         super().__init__()
         self.model_name = resolve_image_model_name(model_name)
@@ -202,19 +317,43 @@ class ContrastiveImageGeneModel(nn.Module):
             checkpoint_path=image_encoder_checkpoint,
         )
         self.image_projection = ProjectionHead(embedding_dim=image_feature_dim)
-        self.gene_projection = ProjectionHead(embedding_dim=gene_dim)
+
+        self.gene_encoder_type = str(gene_encoder).strip().lower()
+        if self.gene_encoder_type == "projection":
+            gene_feature_dim = int(gene_dim)
+            self.gene_backbone = None
+        elif self.gene_encoder_type == "scfoundation":
+            self.gene_backbone = ScFoundationGeneBackbone(
+                repo_dir=scfoundation_repo_dir,
+                checkpoint_path=scfoundation_checkpoint,
+                checkpoint_key=scfoundation_key,
+                pool_type=scfoundation_pool_type,
+                tgthighres=scfoundation_tgthighres,
+            )
+            gene_feature_dim = int(self.gene_backbone.output_dim)
+        else:
+            raise ValueError("gene_encoder must be one of: projection, scfoundation")
+
+        self.gene_projection = ProjectionHead(embedding_dim=gene_feature_dim)
         self.temperature = float(temperature)
 
     def encode_images(self, images: torch.Tensor) -> torch.Tensor:
         features = self.image_encoder(images)
         return self.image_projection(features)
 
-    def encode_genes(self, expressions: torch.Tensor) -> torch.Tensor:
-        return self.gene_projection(expressions)
+    def encode_gene_inputs(self, expressions: torch.Tensor) -> torch.Tensor:
+        if self.gene_encoder_type == "projection":
+            return expressions
+        return self.gene_backbone(expressions)
 
-    def forward(self, batch: dict) -> torch.Tensor:
+    def encode_genes(self, expressions: torch.Tensor) -> torch.Tensor:
+        features = self.encode_gene_inputs(expressions)
+        return self.gene_projection(features)
+
+    def compute_image_gene_loss(self, batch: dict, return_gene_embeddings: bool = False):
         image_embeddings = self.encode_images(batch["image"])
-        gene_embeddings = self.encode_genes(batch["expression"])
+        gene_inputs = batch.get("encoder_expression", batch["expression"])
+        gene_embeddings = self.encode_genes(gene_inputs)
 
         logits = (gene_embeddings @ image_embeddings.T) / self.temperature
         image_similarity = image_embeddings @ image_embeddings.T
@@ -223,4 +362,10 @@ class ContrastiveImageGeneModel(nn.Module):
 
         gene_loss = soft_cross_entropy(logits, targets)
         image_loss = soft_cross_entropy(logits.T, targets.T)
-        return ((gene_loss + image_loss) / 2.0).mean()
+        loss = ((gene_loss + image_loss) / 2.0).mean()
+        if return_gene_embeddings:
+            return loss, gene_embeddings
+        return loss
+
+    def forward(self, batch: dict) -> torch.Tensor:
+        return self.compute_image_gene_loss(batch, return_gene_embeddings=False)

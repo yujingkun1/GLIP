@@ -7,6 +7,7 @@ import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import h5py
 import numpy as np
 import openslide
 import pandas as pd
@@ -18,7 +19,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 from glip import config as CFG
-from glip.utils import assign_position_folds, parse_bool, save_json
+from glip.utils import assign_position_folds, save_json
 
 Image.MAX_IMAGE_PIXELS = None
 
@@ -56,15 +57,48 @@ def is_control_feature(feature_name: str) -> bool:
     return any(feature_name.startswith(prefix) for prefix in CFG.CONTROL_FEATURE_PREFIXES)
 
 
-def _load_gene_names_from_h5ad(h5ad_path: str) -> List[str]:
-    import anndata as ad
+def _decode_h5ad_string_array(values) -> List[str]:
+    decoded = []
+    for value in values:
+        if isinstance(value, bytes):
+            decoded.append(value.decode("utf-8"))
+        else:
+            decoded.append(str(value))
+    return decoded
 
-    adata = ad.read_h5ad(h5ad_path, backed="r")
-    try:
-        return [str(gene_name) for gene_name in adata.var_names]
-    finally:
-        if getattr(adata, "file", None) is not None:
-            adata.file.close()
+
+def _load_gene_names_from_h5ad(h5ad_path: str) -> List[str]:
+    with h5py.File(h5ad_path, "r") as handle:
+        if "var/_index" not in handle:
+            raise KeyError(f"Missing var/_index in {h5ad_path}")
+        return _decode_h5ad_string_array(handle["var/_index"][:])
+
+
+def load_gene_names_from_tsv(tsv_path: str, column: str = "gene_name") -> List[str]:
+    gene_df = pd.read_csv(tsv_path, sep="	")
+    if column in gene_df.columns:
+        return [str(gene_name) for gene_name in gene_df[column].tolist()]
+    first_column = gene_df.columns[0]
+    return [str(gene_name) for gene_name in gene_df[first_column].tolist()]
+
+
+def build_target_to_source_index(source_gene_names: Sequence[str], target_gene_names: Sequence[str]) -> np.ndarray:
+    source_index = {str(gene_name): idx for idx, gene_name in enumerate(source_gene_names)}
+    target_to_source = np.full(len(target_gene_names), -1, dtype=np.int64)
+    for target_idx, gene_name in enumerate(target_gene_names):
+        source_idx = source_index.get(str(gene_name))
+        if source_idx is not None:
+            target_to_source[target_idx] = source_idx
+    return target_to_source
+
+
+def align_expression_from_index_map(expression: np.ndarray, target_to_source_index: np.ndarray) -> np.ndarray:
+    expression = np.asarray(expression, dtype=np.float32)
+    aligned = np.zeros(target_to_source_index.shape[0], dtype=np.float32)
+    valid_mask = target_to_source_index >= 0
+    if valid_mask.any():
+        aligned[valid_mask] = expression[target_to_source_index[valid_mask]]
+    return aligned
 
 
 def resolve_gene_panel(
@@ -338,6 +372,8 @@ class XeniumSingleCellDataset(Dataset):
         augment: bool = False,
         max_cells: int = 0,
         include_image: bool = True,
+        encoder_target_gene_names: Optional[Sequence[str]] = None,
+        encoder_use_raw_counts: bool = False,
     ) -> None:
         super().__init__()
 
@@ -362,6 +398,14 @@ class XeniumSingleCellDataset(Dataset):
             genes_payload = json.load(handle)
         self.gene_names = list(genes_payload["genes"])
         self.num_features = len(self.gene_names)
+        self.encoder_target_gene_names = (
+            [str(gene_name) for gene_name in encoder_target_gene_names]
+            if encoder_target_gene_names is not None
+            else list(self.gene_names)
+        )
+        self.encoder_use_raw_counts = bool(encoder_use_raw_counts)
+        self.encoder_num_features = len(self.encoder_target_gene_names)
+        self._encoder_target_to_source = build_target_to_source_index(self.gene_names, self.encoder_target_gene_names)
 
         metadata_df = pd.read_parquet(processed_paths.metadata_path)
         self.cell_ids = metadata_df["cell_id"].to_numpy(dtype=np.int64, copy=False)
@@ -435,9 +479,17 @@ class XeniumSingleCellDataset(Dataset):
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
         data_index = int(self.indices[index])
-        expression = np.log1p(self.counts[data_index].astype(np.float32, copy=False))
+        raw_expression = self.counts[data_index].astype(np.float32, copy=False)
+        expression = np.log1p(raw_expression)
+        encoder_source_expression = raw_expression if self.encoder_use_raw_counts else expression
+        encoder_expression = align_expression_from_index_map(
+            encoder_source_expression,
+            self._encoder_target_to_source,
+        )
+
         sample = {
             "expression": torch.from_numpy(expression),
+            "encoder_expression": torch.from_numpy(encoder_expression),
             "cell_id": int(self.cell_ids[data_index]),
             "centroid_x": float(self.centroid_x[data_index]),
             "centroid_y": float(self.centroid_y[data_index]),
@@ -455,6 +507,77 @@ class XeniumSingleCellDataset(Dataset):
             except Exception:
                 pass
             self._slide = None
+
+    def __del__(self) -> None:
+        self.close()
+
+
+class ScRNADataset(Dataset):
+    def __init__(
+        self,
+        *,
+        h5ad_path: str,
+        target_gene_names: Sequence[str],
+        use_raw_counts: bool = False,
+        max_cells: int = 0,
+    ) -> None:
+        super().__init__()
+        if not os.path.exists(h5ad_path):
+            raise FileNotFoundError(f"scRNA h5ad file not found: {h5ad_path}")
+
+        self.h5ad_path = os.path.abspath(h5ad_path)
+        self.target_gene_names = [str(gene_name) for gene_name in target_gene_names]
+        self.use_raw_counts = bool(use_raw_counts)
+        self._h5 = None
+
+        with h5py.File(self.h5ad_path, "r") as handle:
+            self.source_gene_names = _decode_h5ad_string_array(handle["var/_index"][:])
+            self.obs_names = _decode_h5ad_string_array(handle["obs/_index"][:])
+            self.num_source_features = int(handle["var/_index"].shape[0])
+            self.num_features = len(self.target_gene_names)
+            total_cells = int(handle["obs/_index"].shape[0])
+
+        self.indices = np.arange(total_cells, dtype=np.int64)
+        if max_cells and max_cells > 0:
+            self.indices = self.indices[: int(max_cells)]
+        self._target_to_source = build_target_to_source_index(self.source_gene_names, self.target_gene_names)
+
+    def __len__(self) -> int:
+        return int(self.indices.shape[0])
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_h5"] = None
+        return state
+
+    def _get_h5(self):
+        if self._h5 is None:
+            self._h5 = h5py.File(self.h5ad_path, "r")
+        return self._h5
+
+    def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
+        data_index = int(self.indices[index])
+        handle = self._get_h5()
+        indptr = handle["X/indptr"]
+        start = int(indptr[data_index])
+        end = int(indptr[data_index + 1])
+        raw_expression = np.zeros(self.num_source_features, dtype=np.float32)
+        if end > start:
+            row_indices = np.asarray(handle["X/indices"][start:end], dtype=np.int64)
+            row_data = np.asarray(handle["X/data"][start:end], dtype=np.float32)
+            raw_expression[row_indices] = row_data
+        expression = raw_expression if self.use_raw_counts else np.log1p(raw_expression)
+        encoder_expression = align_expression_from_index_map(expression, self._target_to_source)
+        return {
+            "encoder_expression": torch.from_numpy(encoder_expression),
+            "sc_index": int(data_index),
+            "obs_name": self.obs_names[data_index],
+        }
+
+    def close(self) -> None:
+        if self._h5 is not None:
+            self._h5.close()
+            self._h5 = None
 
     def __del__(self) -> None:
         self.close()
