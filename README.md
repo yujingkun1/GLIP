@@ -6,10 +6,15 @@ Unified workspace for:
 - Xenium pseudo-spot training
 - Visium/ST spot-level BLEEP training
 
-The original `BLEEP` Visium pipeline has been merged into this repository
-under `glip/visium/` so Xenium- and Visium-level models can be managed in one
-codebase. Core training logic is kept unchanged; only the code organization and
-default output directories were cleaned up.
+The original `BLEEP` Visium pipeline has been merged into this repository.
+The code is now organized symmetrically:
+
+- `glip/xenium/`: Xenium-specific preprocessing, datasets, models, and training
+- `glip/visium/`: Visium/ST-specific BLEEP code
+- `glip/utils.py`: shared helpers
+
+Core training logic is kept unchanged; only the code organization and default
+output directories were cleaned up.
 
 ## What This Project Does
 
@@ -37,17 +42,17 @@ default output directories were cleaned up.
 ## Prepare Cache
 
 ```bash
-python /data/yujk/GLIP/prepare_ncbi784.py
+python /data/yujk/GLIP/prepare_xenium.py
 ```
 
 ## Entry Points
 
 - Xenium cell-level:
   - `python /data/yujk/GLIP/train_xenium.py`
-  - legacy entrypoint: `python /data/yujk/GLIP/train.py`
 - Xenium pseudo-spot:
   - `python /data/yujk/GLIP/train_xenium_pseudospot.py`
-  - legacy entrypoint: `python /data/yujk/GLIP/train_pseudospot.py`
+- Xenium cache preparation:
+  - `python /data/yujk/GLIP/prepare_xenium.py`
 - Visium/ST spot-level:
   - `python /data/yujk/GLIP/train_visium.py`
 

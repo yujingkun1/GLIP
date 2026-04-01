@@ -13,10 +13,10 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 
-from glip import config as CFG
-from glip.data import load_gene_names_from_tsv
-from glip.model import ContrastiveImageGeneModel, resolve_image_model_name
-from glip.pseudospot import (
+from . import config as CFG
+from .data import load_gene_names_from_tsv
+from .model import ContrastiveImageGeneModel, resolve_image_model_name
+from .pseudospot import (
     XeniumPseudoSpotDataset,
     build_pseudospot_output_dir,
     build_pseudospot_paths,
@@ -30,7 +30,7 @@ from glip.utils import (
     save_json,
     seed_everything,
 )
-from train import configure_hf_hub, train_epoch
+from .train import configure_hf_hub, train_epoch
 
 
 def create_loader(dataset, batch_size: int, num_workers: int, shuffle: bool) -> DataLoader:

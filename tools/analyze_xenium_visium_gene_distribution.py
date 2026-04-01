@@ -28,7 +28,7 @@ from sklearn.metrics import silhouette_score
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 
-from glip.data import is_control_feature
+from glip.xenium.data import is_control_feature
 from glip.utils import parse_bool, sample_indices, save_json, seed_everything
 
 

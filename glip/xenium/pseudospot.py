@@ -15,8 +15,8 @@ import torchvision.transforms.functional as TF
 from PIL import Image
 from torch.utils.data import Dataset
 
-from glip import config as CFG
-from glip.data import (
+from . import config as CFG
+from .data import (
     _SimpleWSI,
     align_expression_from_index_map,
     build_processed_paths,

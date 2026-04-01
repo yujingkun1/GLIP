@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 
-from glip.data import prepare_processed_dataset
+from .data import prepare_processed_dataset
 from glip.utils import parse_bool
 
 

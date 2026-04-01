@@ -38,7 +38,7 @@ from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 
-from glip.data import (
+from glip.xenium.data import (
     _SimpleWSI,
     build_processed_paths,
     prepare_processed_dataset,

@@ -15,15 +15,15 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
-from glip import config as CFG
-from glip.data import (
+from . import config as CFG
+from .data import (
     ScRNADataset,
     XeniumSingleCellDataset,
     build_processed_paths,
     load_gene_names_from_tsv,
     prepare_processed_dataset,
 )
-from glip.model import ContrastiveImageGeneModel, resolve_image_model_name
+from .model import ContrastiveImageGeneModel, resolve_image_model_name
 from glip.utils import (
     AvgMeter,
     compute_pearson_metrics,

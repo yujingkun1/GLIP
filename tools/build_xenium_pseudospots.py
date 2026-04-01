@@ -28,7 +28,7 @@ from sklearn.metrics import silhouette_score
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 
-from glip.pseudospot import (
+from glip.xenium.pseudospot import (
     build_pseudospot_output_dir,
     build_pseudospot_paths,
     prepare_pseudospot_dataset,

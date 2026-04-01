@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Entry point for Xenium single-cell training."""
+"""Explicit entry point for Xenium single-cell training."""
 
-from train import main
+from glip.xenium.train import main
 
 
 if __name__ == "__main__":

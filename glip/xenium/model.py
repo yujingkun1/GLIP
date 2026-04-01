@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torch import nn
 from torchvision import models
 
-from glip import config as CFG
+from . import config as CFG
 
 
 UNI_MODEL_NAME = "hf-hub:MahmoodLab/UNI2-h"

@@ -1,1 +1,1 @@
-"""GLIP single-cell contrastive training package."""
+"""GLIP package with shared, Xenium, and Visium-specific modules."""

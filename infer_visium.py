@@ -24,9 +24,9 @@ from scipy.spatial import cKDTree
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from glip import config as CFG
-from glip.data import XeniumSingleCellDataset, _SimpleWSI, load_gene_names_from_tsv, prepare_processed_dataset
-from glip.model import ContrastiveImageGeneModel, resolve_image_model_name
+from glip.xenium import config as CFG
+from glip.xenium.data import XeniumSingleCellDataset, _SimpleWSI, load_gene_names_from_tsv, prepare_processed_dataset
+from glip.xenium.model import ContrastiveImageGeneModel, resolve_image_model_name
 from glip.utils import compute_pearson_metrics, parse_bool, safe_pearson, sample_indices, save_json
 
 

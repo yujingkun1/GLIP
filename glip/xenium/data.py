@@ -18,7 +18,7 @@ import torchvision.transforms.functional as TF
 from PIL import Image
 from torch.utils.data import Dataset
 
-from glip import config as CFG
+from . import config as CFG
 from glip.utils import assign_position_folds, save_json
 
 Image.MAX_IMAGE_PIXELS = None
