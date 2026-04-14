@@ -412,6 +412,8 @@ def main() -> None:
 
     combined_train = ConcatDataset([vis_train, xen_train])
     combined_train_eval = ConcatDataset([vis_train_eval, xen_train_eval])
+    vis_train_eval_loader = create_loader(vis_train_eval, args.eval_batch_size, args.num_workers, shuffle=False)
+    xen_train_eval_loader = create_loader(xen_train_eval, args.eval_batch_size, args.num_workers, shuffle=False)
     vis_test_loader = create_loader(vis_test, args.eval_batch_size, args.num_workers, shuffle=False)
     xen_test_loader = create_loader(xen_test, args.eval_batch_size, args.num_workers, shuffle=False)
     train_loader = create_loader(combined_train, args.batch_size, args.num_workers, shuffle=True)
@@ -487,28 +489,42 @@ def main() -> None:
     best_payload = torch.load(os.path.join(args.run_dir, 'best.pt'), map_location=device)
     model.load_state_dict(best_payload['model_state_dict'])
 
+    visium_bank = collect_spot_bank(model, vis_train_eval_loader, device)
+    xenium_bank = collect_spot_bank(model, xen_train_eval_loader, device)
     joint_bank = collect_spot_bank(model, train_eval_loader, device)
     vis_queries = collect_image_queries(model, vis_test_loader, device)
     xen_queries = collect_image_queries(model, xen_test_loader, device)
 
-    vis_predictions = predict_expression_from_retrieval(joint_bank, vis_queries, top_k=args.top_k, chunk_size=args.retrieval_chunk_size)
-    xen_predictions = predict_expression_from_retrieval(joint_bank, xen_queries, top_k=args.top_k, chunk_size=args.retrieval_chunk_size)
+    vis_predictions = predict_expression_from_retrieval(visium_bank, vis_queries, top_k=args.top_k, chunk_size=args.retrieval_chunk_size)
+    xen_predictions = predict_expression_from_retrieval(xenium_bank, xen_queries, top_k=args.top_k, chunk_size=args.retrieval_chunk_size)
+    vis_predictions_joint_bank = predict_expression_from_retrieval(joint_bank, vis_queries, top_k=args.top_k, chunk_size=args.retrieval_chunk_size)
+    xen_predictions_joint_bank = predict_expression_from_retrieval(joint_bank, xen_queries, top_k=args.top_k, chunk_size=args.retrieval_chunk_size)
 
     vis_metrics = compute_metrics(vis_predictions, vis_queries['expressions'].numpy())
     xen_metrics = compute_metrics(xen_predictions, xen_queries['expressions'].numpy())
+    vis_joint_bank_metrics = compute_metrics(vis_predictions_joint_bank, vis_queries['expressions'].numpy())
+    xen_joint_bank_metrics = compute_metrics(xen_predictions_joint_bank, xen_queries['expressions'].numpy())
     vis_metrics['top_k'] = int(args.top_k)
     xen_metrics['top_k'] = int(args.top_k)
     vis_metrics['heldout_sample'] = args.visium_heldout_sample
     xen_metrics['xenium_sample_id'] = args.xenium_sample_id
+    vis_joint_bank_metrics['top_k'] = int(args.top_k)
+    xen_joint_bank_metrics['top_k'] = int(args.top_k)
+    vis_joint_bank_metrics['heldout_sample'] = args.visium_heldout_sample
+    xen_joint_bank_metrics['xenium_sample_id'] = args.xenium_sample_id
 
     summary = {
         'history': history,
         'shared_gene_count': len(shared_genes),
         'shared_genes_preview': shared_genes[:50],
         'best_epoch': int(best_payload['epoch']),
+        'visium_bank_size': int(visium_bank['embeddings'].shape[0]),
+        'xenium_bank_size': int(xenium_bank['embeddings'].shape[0]),
+        'joint_bank_size': int(joint_bank['embeddings'].shape[0]),
         'visium_test_metrics': vis_metrics,
         'xenium_test_metrics': xen_metrics,
-        'joint_bank_size': int(joint_bank['embeddings'].shape[0]),
+        'visium_test_metrics_joint_bank': vis_joint_bank_metrics,
+        'xenium_test_metrics_joint_bank': xen_joint_bank_metrics,
         'visium_test_queries': int(vis_queries['embeddings'].shape[0]),
         'xenium_test_queries': int(xen_queries['embeddings'].shape[0]),
         'manual_baseline_override': True,
@@ -519,6 +535,8 @@ def main() -> None:
     rows = [
         {'target': 'visium', **vis_metrics},
         {'target': 'xenium_pseudospot', **xen_metrics},
+        {'target': 'visium_joint_bank_diag', **vis_joint_bank_metrics},
+        {'target': 'xenium_joint_bank_diag', **xen_joint_bank_metrics},
     ]
     csv_path = os.path.join(args.run_dir, 'metrics_table.csv')
     with open(csv_path, 'w', newline='', encoding='utf-8') as handle:
