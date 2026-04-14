@@ -649,6 +649,24 @@ def main():
     CFG.spot_embedding = spot_embedding_dim
 
     all_fold_metrics = []
+    completed_folds = {}
+    completed_metrics_path = os.path.join(args.exp_name, "loo_fold_metrics.json")
+    if rank == 0 and os.path.exists(completed_metrics_path):
+        try:
+            existing_metrics = json.load(open(completed_metrics_path, "r", encoding="utf-8"))
+            if isinstance(existing_metrics, list):
+                for fold_metrics in existing_metrics:
+                    heldout_sample = fold_metrics.get("heldout_sample")
+                    if heldout_sample:
+                        completed_folds[heldout_sample] = fold_metrics
+                all_fold_metrics.extend(existing_metrics)
+                if completed_folds:
+                    print(
+                        f"Resuming existing experiment: found {len(completed_folds)} completed fold(s) in "
+                        f"{completed_metrics_path}"
+                    )
+        except Exception as exc:
+            print(f"Warning: failed to load existing fold metrics from {completed_metrics_path}: {exc}")
 
     for fold_idx, heldout_sample in enumerate(sample_ids):
         train_samples = [sample_id for sample_id in sample_ids if sample_id != heldout_sample]
@@ -657,6 +675,12 @@ def main():
         best_model_path = os.path.join(fold_dir, "best.pt")
 
         if rank == 0:
+            if heldout_sample in completed_folds:
+                print("")
+                print(f"=== Fold {fold_idx + 1}/{len(sample_ids)} ===")
+                print(f"Held-out sample: {heldout_sample}")
+                print("Skipping fold because pearson_metrics already exist in loo_fold_metrics.json")
+                continue
             os.makedirs(fold_dir, exist_ok=True)
             print("")
             print(f"=== Fold {fold_idx + 1}/{len(sample_ids)} ===")
