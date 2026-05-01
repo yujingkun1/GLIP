@@ -93,6 +93,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-xenium-test-spots", type=int, default=0, help="Xenium test cap for plotting")
     parser.add_argument("--umap-neighbors", type=int, default=30, help="UMAP n_neighbors")
     parser.add_argument("--umap-min-dist", type=float, default=0.1, help="UMAP min_dist")
+    parser.add_argument("--embedding-views", default="fused,shared", help="Comma-separated embedding views to compare")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     return parser.parse_args()
 
@@ -116,6 +117,21 @@ def resolve_fold_dir(run_dir: str, fold_index: int) -> Path:
 def load_json(path: Path) -> Dict:
     with path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def parse_embedding_views(raw_views: str) -> List[str]:
+    views = []
+    for raw_view in str(raw_views).split(","):
+        view = raw_view.strip().lower()
+        if not view:
+            continue
+        if view == "alignment":
+            view = "shared"
+        if view not in {"fused", "shared", "private"}:
+            raise ValueError(f"Unsupported embedding view: {raw_view}")
+        if view not in views:
+            views.append(view)
+    return views or ["fused"]
 
 
 def build_dataset_args(config: Dict, cli_args: argparse.Namespace) -> argparse.Namespace:
@@ -151,6 +167,12 @@ def load_joint_model(fold_dir: Path, device: torch.device, gene_dim: int) -> Tup
         pretrained=bool(config["pretrained"]),
         checkpoint_path=config["image_encoder_checkpoint"],
         use_platform_token=bool(config["module_platform_token"]),
+        use_shared_private=bool(config.get("module_shared_private", False)),
+        shared_private_dim=int(config.get("shared_private_dim", 256)),
+        private_dim=int(config.get("private_dim", 64)),
+        private_gate=float(config.get("private_gate", 0.25)),
+        shared_align_weight=float(config.get("shared_align_weight", 0.05)),
+        orth_weight=float(config.get("orth_weight", 0.01)),
         use_image_ot=bool(config["module_image_ot"]),
         use_gene_ot=bool(config["module_gene_ot"]),
         ot_transport=str(config.get("ot_transport", "ot")),
@@ -175,6 +197,12 @@ def rebuild_model_with_gene_dim(fold_dir: Path, device: torch.device, gene_dim: 
         pretrained=bool(config["pretrained"]),
         checkpoint_path=config["image_encoder_checkpoint"],
         use_platform_token=bool(config["module_platform_token"]),
+        use_shared_private=bool(config.get("module_shared_private", False)),
+        shared_private_dim=int(config.get("shared_private_dim", 256)),
+        private_dim=int(config.get("private_dim", 64)),
+        private_gate=float(config.get("private_gate", 0.25)),
+        shared_align_weight=float(config.get("shared_align_weight", 0.05)),
+        orth_weight=float(config.get("orth_weight", 0.01)),
         use_image_ot=bool(config["module_image_ot"]),
         use_gene_ot=bool(config["module_gene_ot"]),
         ot_transport=str(config.get("ot_transport", "ot")),
@@ -231,6 +259,7 @@ def collect_embeddings(
     model_label: str,
     split_name: str,
     platform_label: str,
+    embedding_view: str,
 ) -> pd.DataFrame:
     image_embeddings: List[np.ndarray] = []
     gene_embeddings: List[np.ndarray] = []
@@ -243,8 +272,8 @@ def collect_embeddings(
         platform_ids = batch.get("platform_id")
         if platform_ids is not None:
             platform_ids = platform_ids.to(device, non_blocking=True)
-        image_batch = model.encode_images(images, platform_ids=platform_ids).detach().cpu().numpy()
-        gene_batch = model.encode_spots(expressions, platform_ids=platform_ids).detach().cpu().numpy()
+        image_batch = model.encode_images(images, platform_ids=platform_ids, embedding_view=embedding_view).detach().cpu().numpy()
+        gene_batch = model.encode_spots(expressions, platform_ids=platform_ids, embedding_view=embedding_view).detach().cpu().numpy()
         image_embeddings.append(image_batch)
         gene_embeddings.append(gene_batch)
         barcodes.extend([str(value) for value in batch["barcode"]])
@@ -255,6 +284,7 @@ def collect_embeddings(
     frame = pd.DataFrame(
         {
             "model": model_label,
+            "embedding_view": embedding_view,
             "split": split_name,
             "platform": platform_label,
             "sample_id": sample_ids,
@@ -389,6 +419,7 @@ def save_comparison_plot(
 def main() -> None:
     args = parse_args()
     args.include_test = parse_bool(args.include_test)
+    embedding_views = parse_embedding_views(args.embedding_views)
     seed_everything(args.seed)
     sns.set_theme(style="whitegrid", context="talk")
     os.makedirs(args.output_dir, exist_ok=True)
@@ -409,17 +440,21 @@ def main() -> None:
         config = load_json(fold_dir / "joint_config.json")
         loaders, gene_dim = build_loaders(config, args)
         model, _ = load_joint_model(fold_dir, device, gene_dim)
-        frame_parts = [
-            collect_embeddings(model, loaders["visium_train"], device, model_label, "train", "visium"),
-            collect_embeddings(model, loaders["xenium_train"], device, model_label, "train", "xenium"),
-        ]
-        if args.include_test:
+        frame_parts = []
+        for embedding_view in embedding_views:
             frame_parts.extend(
                 [
-                    collect_embeddings(model, loaders["visium_test"], device, model_label, "test", "visium"),
-                    collect_embeddings(model, loaders["xenium_test"], device, model_label, "test", "xenium"),
+                    collect_embeddings(model, loaders["visium_train"], device, model_label, "train", "visium", embedding_view),
+                    collect_embeddings(model, loaders["xenium_train"], device, model_label, "train", "xenium", embedding_view),
                 ]
             )
+            if args.include_test:
+                frame_parts.extend(
+                    [
+                        collect_embeddings(model, loaders["visium_test"], device, model_label, "test", "visium", embedding_view),
+                        collect_embeddings(model, loaders["xenium_test"], device, model_label, "test", "xenium", embedding_view),
+                    ]
+                )
         model_frame = pd.concat(frame_parts, axis=0, ignore_index=True)
         model_frame = apply_plot_limits(model_frame, args, seed=args.seed)
         all_frames.append(model_frame)
@@ -440,25 +475,33 @@ def main() -> None:
     gene_metrics: Dict[str, Dict] = {}
 
     for model_label in [args.label_a, args.label_b]:
-        subset = combined.loc[combined["model"] == model_label].reset_index(drop=True)
-        image_df, img_metrics = build_umap_table(
-            subset,
-            embedding_column="image_embedding",
-            seed=args.seed,
-            n_neighbors=args.umap_neighbors,
-            min_dist=args.umap_min_dist,
-        )
-        gene_df, gen_metrics = build_umap_table(
-            subset,
-            embedding_column="gene_embedding",
-            seed=args.seed,
-            n_neighbors=args.umap_neighbors,
-            min_dist=args.umap_min_dist,
-        )
-        image_tables.append(image_df)
-        gene_tables.append(gene_df)
-        image_metrics[model_label] = img_metrics
-        gene_metrics[model_label] = gen_metrics
+        for embedding_view in embedding_views:
+            subset = combined.loc[
+                (combined["model"] == model_label) & (combined["embedding_view"] == embedding_view)
+            ].reset_index(drop=True)
+            metric_label = f"{model_label} [{embedding_view}]"
+            subset = subset.copy()
+            subset["model"] = metric_label
+            if len(subset) == 0:
+                continue
+            image_df, img_metrics = build_umap_table(
+                subset,
+                embedding_column="image_embedding",
+                seed=args.seed,
+                n_neighbors=args.umap_neighbors,
+                min_dist=args.umap_min_dist,
+            )
+            gene_df, gen_metrics = build_umap_table(
+                subset,
+                embedding_column="gene_embedding",
+                seed=args.seed,
+                n_neighbors=args.umap_neighbors,
+                min_dist=args.umap_min_dist,
+            )
+            image_tables.append(image_df)
+            gene_tables.append(gene_df)
+            image_metrics[metric_label] = img_metrics
+            gene_metrics[metric_label] = gen_metrics
 
     image_output = pd.concat(image_tables, axis=0, ignore_index=True)
     gene_output = pd.concat(gene_tables, axis=0, ignore_index=True)

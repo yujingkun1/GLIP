@@ -110,7 +110,7 @@ def compute_embedding_separation_metrics(features: np.ndarray, labels: Sequence[
     if k >= 1:
         knn = NearestNeighbors(n_neighbors=k + 1, metric="euclidean")
         knn.fit(features)
-        neighbor_indices = knn.kneighbors(return_distance=False)[:, 1:]
+        neighbor_indices = knn.kneighbors(features, return_distance=False)[:, 1:]
         metrics["same_label_knn_fraction_k15"] = float(np.mean(encoded[:, None] == encoded[neighbor_indices]))
     return metrics
 

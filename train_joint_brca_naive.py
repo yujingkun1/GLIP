@@ -105,6 +105,11 @@ class RunConfig:
     module_naive_joint: bool
     module_platform_token: bool
     module_shared_private: bool
+    shared_private_dim: int
+    private_dim: int
+    private_gate: float
+    shared_align_weight: float
+    orth_weight: float
     module_ot: bool
     module_image_ot: bool
     module_gene_ot: bool
@@ -191,6 +196,12 @@ class PlatformConditionedModel(torch.nn.Module):
         base_model: torch.nn.Module,
         use_platform_token: bool = False,
         num_platforms: int = 2,
+        use_shared_private: bool = False,
+        shared_private_dim: int = 256,
+        private_dim: int = 64,
+        private_gate: float = 0.25,
+        shared_align_weight: float = 0.05,
+        orth_weight: float = 0.01,
         use_image_ot: bool = False,
         use_gene_ot: bool = False,
         ot_transport: str = "ot",
@@ -203,6 +214,7 @@ class PlatformConditionedModel(torch.nn.Module):
         super().__init__()
         self.base_model = base_model
         self.use_platform_token = bool(use_platform_token)
+        self.use_shared_private = bool(use_shared_private)
         self.use_image_ot = bool(use_image_ot)
         self.use_gene_ot = bool(use_gene_ot)
         self.ot_transport = str(ot_transport).strip().lower()
@@ -210,12 +222,48 @@ class PlatformConditionedModel(torch.nn.Module):
             raise ValueError(f"Unsupported OT transport mode: {ot_transport}")
         self.ot_image_weight = float(ot_image_weight)
         self.ot_gene_weight = float(ot_gene_weight)
+        self.shared_align_weight = float(shared_align_weight)
+        self.orth_weight = float(orth_weight)
         self.ot_sinkhorn_eps = float(ot_sinkhorn_eps)
         self.ot_sinkhorn_iters = int(ot_sinkhorn_iters)
         self.uot_marginal_weight = float(uot_marginal_weight)
         self.temperature = getattr(base_model, "temperature")
         projection_dim = int(base_model.image_projection.projection.out_features)
+        self.projection_dim = projection_dim
+        self.shared_private_dim = int(shared_private_dim)
+        self.private_dim = int(private_dim)
+        self.private_gate = float(private_gate)
         self.platform_token = torch.nn.Embedding(num_platforms, projection_dim) if self.use_platform_token else None
+        if self.use_shared_private:
+            if self.shared_private_dim <= 0:
+                raise ValueError("shared_private_dim must be positive when shared/private is enabled.")
+            if self.private_dim <= 0:
+                raise ValueError("private_dim must be positive when shared/private is enabled.")
+            self.image_shared_head = self._make_latent_head(projection_dim, self.shared_private_dim)
+            self.gene_shared_head = self._make_latent_head(projection_dim, self.shared_private_dim)
+            self.image_private_head = self._make_latent_head(projection_dim, self.private_dim)
+            self.gene_private_head = self._make_latent_head(projection_dim, self.private_dim)
+            self.image_private_adapter = torch.nn.Linear(self.private_dim, self.shared_private_dim)
+            self.gene_private_adapter = torch.nn.Linear(self.private_dim, self.shared_private_dim)
+            self.image_fused_norm = torch.nn.LayerNorm(self.shared_private_dim)
+            self.gene_fused_norm = torch.nn.LayerNorm(self.shared_private_dim)
+        else:
+            self.image_shared_head = None
+            self.gene_shared_head = None
+            self.image_private_head = None
+            self.gene_private_head = None
+            self.image_private_adapter = None
+            self.gene_private_adapter = None
+            self.image_fused_norm = None
+            self.gene_fused_norm = None
+
+    @staticmethod
+    def _make_latent_head(input_dim: int, output_dim: int) -> torch.nn.Module:
+        return torch.nn.Sequential(
+            torch.nn.Linear(input_dim, output_dim),
+            torch.nn.GELU(),
+            torch.nn.LayerNorm(output_dim),
+        )
 
     @property
     def image_encoder(self):
@@ -234,14 +282,75 @@ class PlatformConditionedModel(torch.nn.Module):
             return embeddings
         return embeddings + self.platform_token(platform_ids)
 
-    def encode_images(self, images: torch.Tensor, platform_ids: torch.Tensor | None = None) -> torch.Tensor:
+    def encode_images(
+        self,
+        images: torch.Tensor,
+        platform_ids: torch.Tensor | None = None,
+        embedding_view: str = "fused",
+    ) -> torch.Tensor:
         image_features = self.base_model.image_encoder(images)
         image_embeddings = self.base_model.image_projection(image_features)
+        if self.use_shared_private:
+            return self._select_embedding_view(
+                self._split_embeddings(image_embeddings, platform_ids, modality="image"),
+                embedding_view=embedding_view,
+            )
         return self._apply_platform_token(image_embeddings, platform_ids)
 
-    def encode_spots(self, reduced_expression: torch.Tensor, platform_ids: torch.Tensor | None = None) -> torch.Tensor:
+    def encode_spots(
+        self,
+        reduced_expression: torch.Tensor,
+        platform_ids: torch.Tensor | None = None,
+        embedding_view: str = "fused",
+    ) -> torch.Tensor:
         spot_embeddings = self.base_model.spot_projection(reduced_expression)
+        if self.use_shared_private:
+            return self._select_embedding_view(
+                self._split_embeddings(spot_embeddings, platform_ids, modality="gene"),
+                embedding_view=embedding_view,
+            )
         return self._apply_platform_token(spot_embeddings, platform_ids)
+
+    def _split_embeddings(
+        self,
+        base_embeddings: torch.Tensor,
+        platform_ids: torch.Tensor | None,
+        *,
+        modality: str,
+    ) -> Dict[str, torch.Tensor]:
+        if modality == "image":
+            shared_head = self.image_shared_head
+            private_head = self.image_private_head
+            private_adapter = self.image_private_adapter
+            fused_norm = self.image_fused_norm
+        elif modality == "gene":
+            shared_head = self.gene_shared_head
+            private_head = self.gene_private_head
+            private_adapter = self.gene_private_adapter
+            fused_norm = self.gene_fused_norm
+        else:
+            raise ValueError(f"Unsupported shared/private modality: {modality}")
+        if shared_head is None or private_head is None or private_adapter is None or fused_norm is None:
+            raise RuntimeError("Shared/private heads are not initialized.")
+        shared = shared_head(base_embeddings)
+        private_input = self._apply_platform_token(base_embeddings, platform_ids)
+        private = private_head(private_input)
+        private_projected = private_adapter(private)
+        fused = fused_norm(shared + self.private_gate * private_projected)
+        return {
+            "shared": shared,
+            "private": private,
+            "private_projected": private_projected,
+            "fused": fused,
+        }
+
+    def _select_embedding_view(self, views: Dict[str, torch.Tensor], embedding_view: str) -> torch.Tensor:
+        view = str(embedding_view or "fused").strip().lower()
+        if view == "alignment":
+            view = "shared"
+        if view not in views:
+            raise ValueError(f"Unsupported embedding_view={embedding_view!r}; expected one of {sorted(views)}")
+        return views[view]
 
     def compute_contrastive_loss(
         self,
@@ -375,14 +484,95 @@ class PlatformConditionedModel(torch.nn.Module):
             weight=self.ot_gene_weight,
         )
 
+    def compute_cross_covariance_loss(
+        self,
+        shared_embeddings: torch.Tensor,
+        private_embeddings: torch.Tensor,
+        platform_ids: torch.Tensor | None,
+    ) -> torch.Tensor:
+        zero = shared_embeddings.new_zeros(())
+        if shared_embeddings.size(0) < 2:
+            return zero
+
+        losses = []
+        if platform_ids is None:
+            masks = [torch.ones(shared_embeddings.size(0), dtype=torch.bool, device=shared_embeddings.device)]
+        else:
+            masks = [platform_ids == platform_id for platform_id in torch.unique(platform_ids)]
+
+        for mask in masks:
+            if int(mask.sum().item()) < 2:
+                continue
+            shared = shared_embeddings[mask].float()
+            private = private_embeddings[mask].float()
+            shared = shared - shared.mean(dim=0, keepdim=True)
+            private = private - private.mean(dim=0, keepdim=True)
+            denom = max(shared.size(0) - 1, 1)
+            cross_covariance = (shared.T @ private) / float(denom)
+            losses.append(cross_covariance.pow(2).mean())
+
+        if not losses:
+            return zero
+        return torch.stack(losses).mean()
+
+    def compute_shared_private_orth_loss(
+        self,
+        image_views: Dict[str, torch.Tensor],
+        gene_views: Dict[str, torch.Tensor],
+        platform_ids: torch.Tensor | None,
+    ) -> torch.Tensor:
+        image_loss = self.compute_cross_covariance_loss(image_views["shared"], image_views["private"], platform_ids)
+        gene_loss = self.compute_cross_covariance_loss(gene_views["shared"], gene_views["private"], platform_ids)
+        return 0.5 * (image_loss + gene_loss)
+
     def forward(self, batch: Dict[str, torch.Tensor], return_components: bool = False):
         platform_ids = batch.get("platform_id")
-        image_embeddings = self.encode_images(batch["image"], platform_ids=platform_ids)
-        spot_embeddings = self.encode_spots(batch["reduced_expression"], platform_ids=platform_ids)
+        image_features = self.base_model.image_encoder(batch["image"])
+        image_base_embeddings = self.base_model.image_projection(image_features)
+        spot_base_embeddings = self.base_model.spot_projection(batch["reduced_expression"])
+
+        zero = image_base_embeddings.new_zeros(())
+        if self.use_shared_private:
+            image_views = self._split_embeddings(image_base_embeddings, platform_ids, modality="image")
+            gene_views = self._split_embeddings(spot_base_embeddings, platform_ids, modality="gene")
+            image_embeddings = image_views["fused"]
+            spot_embeddings = gene_views["fused"]
+        else:
+            image_views = {}
+            gene_views = {}
+            image_embeddings = self._apply_platform_token(image_base_embeddings, platform_ids)
+            spot_embeddings = self._apply_platform_token(spot_base_embeddings, platform_ids)
+
         main_loss = self.compute_contrastive_loss(image_embeddings, spot_embeddings)
         image_ot_loss, image_ot_pairs = self.compute_image_ot_loss(image_embeddings, platform_ids)
         gene_ot_loss, gene_ot_pairs = self.compute_gene_ot_loss(spot_embeddings, platform_ids)
-        total_loss = main_loss + self.ot_image_weight * image_ot_loss + self.ot_gene_weight * gene_ot_loss
+        shared_image_align_loss = zero
+        shared_gene_align_loss = zero
+        shared_image_align_pairs = 0
+        shared_gene_align_pairs = 0
+        orth_loss = zero
+        if self.use_shared_private:
+            shared_image_align_loss, shared_image_align_pairs = self.compute_embedding_ot_loss(
+                image_views["shared"],
+                platform_ids,
+                enabled=True,
+                weight=self.shared_align_weight,
+            )
+            shared_gene_align_loss, shared_gene_align_pairs = self.compute_embedding_ot_loss(
+                gene_views["shared"],
+                platform_ids,
+                enabled=True,
+                weight=self.shared_align_weight,
+            )
+            orth_loss = self.compute_shared_private_orth_loss(image_views, gene_views, platform_ids)
+
+        total_loss = (
+            main_loss
+            + self.ot_image_weight * image_ot_loss
+            + self.ot_gene_weight * gene_ot_loss
+            + self.shared_align_weight * (shared_image_align_loss + shared_gene_align_loss)
+            + self.orth_weight * orth_loss
+        )
         if not return_components:
             return total_loss
         return {
@@ -390,8 +580,13 @@ class PlatformConditionedModel(torch.nn.Module):
             "main_loss": main_loss,
             "image_ot_loss": image_ot_loss,
             "gene_ot_loss": gene_ot_loss,
+            "shared_image_align_loss": shared_image_align_loss,
+            "shared_gene_align_loss": shared_gene_align_loss,
+            "orth_loss": orth_loss,
             "image_ot_pairs": int(image_ot_pairs),
             "gene_ot_pairs": int(gene_ot_pairs),
+            "shared_image_align_pairs": int(shared_image_align_pairs),
+            "shared_gene_align_pairs": int(shared_gene_align_pairs),
         }
 
 
@@ -400,10 +595,17 @@ def train_epoch(model, train_loader: DataLoader, optimizer, device: torch.device
     main_loss_meter = AvgMeter("main_loss")
     image_ot_loss_meter = AvgMeter("image_ot_loss")
     gene_ot_loss_meter = AvgMeter("gene_ot_loss")
+    shared_image_align_loss_meter = AvgMeter("shared_image_align_loss")
+    shared_gene_align_loss_meter = AvgMeter("shared_gene_align_loss")
+    orth_loss_meter = AvgMeter("orth_loss")
     image_ot_active_batch_meter = AvgMeter("image_ot_active_batches")
     gene_ot_active_batch_meter = AvgMeter("gene_ot_active_batches")
+    shared_image_align_active_batch_meter = AvgMeter("shared_image_align_active_batches")
+    shared_gene_align_active_batch_meter = AvgMeter("shared_gene_align_active_batches")
     image_ot_pairs_meter = AvgMeter("image_ot_pairs")
     gene_ot_pairs_meter = AvgMeter("gene_ot_pairs")
+    shared_image_align_pairs_meter = AvgMeter("shared_image_align_pairs")
+    shared_gene_align_pairs_meter = AvgMeter("shared_gene_align_pairs")
     tqdm_object = tqdm(train_loader, total=len(train_loader), desc="joint_train")
     model.train()
     for batch in tqdm_object:
@@ -418,15 +620,24 @@ def train_epoch(model, train_loader: DataLoader, optimizer, device: torch.device
         main_loss_meter.update(float(loss_components["main_loss"].item()), count)
         image_ot_loss_meter.update(float(loss_components["image_ot_loss"].item()), count)
         gene_ot_loss_meter.update(float(loss_components["gene_ot_loss"].item()), count)
+        shared_image_align_loss_meter.update(float(loss_components["shared_image_align_loss"].item()), count)
+        shared_gene_align_loss_meter.update(float(loss_components["shared_gene_align_loss"].item()), count)
+        orth_loss_meter.update(float(loss_components["orth_loss"].item()), count)
         image_ot_active_batch_meter.update(1.0 if int(loss_components["image_ot_pairs"]) > 0 else 0.0, 1)
         gene_ot_active_batch_meter.update(1.0 if int(loss_components["gene_ot_pairs"]) > 0 else 0.0, 1)
+        shared_image_align_active_batch_meter.update(1.0 if int(loss_components["shared_image_align_pairs"]) > 0 else 0.0, 1)
+        shared_gene_align_active_batch_meter.update(1.0 if int(loss_components["shared_gene_align_pairs"]) > 0 else 0.0, 1)
         image_ot_pairs_meter.update(float(loss_components["image_ot_pairs"]), 1)
         gene_ot_pairs_meter.update(float(loss_components["gene_ot_pairs"]), 1)
+        shared_image_align_pairs_meter.update(float(loss_components["shared_image_align_pairs"]), 1)
+        shared_gene_align_pairs_meter.update(float(loss_components["shared_gene_align_pairs"]), 1)
         tqdm_object.set_postfix(
             total=total_loss_meter.avg,
             main=main_loss_meter.avg,
             img_ot=image_ot_loss_meter.avg,
             gene_ot=gene_ot_loss_meter.avg,
+            sp_align=shared_gene_align_loss_meter.avg,
+            orth=orth_loss_meter.avg,
             lr=get_lr(optimizer),
         )
     return {
@@ -434,10 +645,17 @@ def train_epoch(model, train_loader: DataLoader, optimizer, device: torch.device
         "main_loss": float(main_loss_meter.avg),
         "image_ot_loss": float(image_ot_loss_meter.avg),
         "gene_ot_loss": float(gene_ot_loss_meter.avg),
+        "shared_image_align_loss": float(shared_image_align_loss_meter.avg),
+        "shared_gene_align_loss": float(shared_gene_align_loss_meter.avg),
+        "orth_loss": float(orth_loss_meter.avg),
         "image_ot_active_fraction": float(image_ot_active_batch_meter.avg),
         "gene_ot_active_fraction": float(gene_ot_active_batch_meter.avg),
+        "shared_image_align_active_fraction": float(shared_image_align_active_batch_meter.avg),
+        "shared_gene_align_active_fraction": float(shared_gene_align_active_batch_meter.avg),
         "image_ot_pairs_mean": float(image_ot_pairs_meter.avg),
         "gene_ot_pairs_mean": float(gene_ot_pairs_meter.avg),
+        "shared_image_align_pairs_mean": float(shared_image_align_pairs_meter.avg),
+        "shared_gene_align_pairs_mean": float(shared_gene_align_pairs_meter.avg),
     }
 
 
@@ -568,6 +786,12 @@ def build_model(
     pretrained: bool,
     checkpoint_path: str,
     use_platform_token: bool = False,
+    use_shared_private: bool = False,
+    shared_private_dim: int = 256,
+    private_dim: int = 64,
+    private_gate: float = 0.25,
+    shared_align_weight: float = 0.05,
+    orth_weight: float = 0.01,
     use_image_ot: bool = False,
     use_gene_ot: bool = False,
     ot_transport: str = "ot",
@@ -595,6 +819,12 @@ def build_model(
     return PlatformConditionedModel(
         base_model,
         use_platform_token=use_platform_token,
+        use_shared_private=use_shared_private,
+        shared_private_dim=shared_private_dim,
+        private_dim=private_dim,
+        private_gate=private_gate,
+        shared_align_weight=shared_align_weight,
+        orth_weight=orth_weight,
         use_image_ot=use_image_ot,
         use_gene_ot=use_gene_ot,
         ot_transport=ot_transport,
@@ -736,6 +966,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--module-naive-joint', default='true')
     parser.add_argument('--module-platform-token', default='false')
     parser.add_argument('--module-shared-private', default='false')
+    parser.add_argument('--shared-private-dim', type=int, default=256)
+    parser.add_argument('--private-dim', type=int, default=64)
+    parser.add_argument('--private-gate', type=float, default=0.25)
+    parser.add_argument('--shared-align-weight', type=float, default=0.05)
+    parser.add_argument('--orth-weight', type=float, default=0.01)
     parser.add_argument('--module-ot', default='false')
     parser.add_argument('--module-image-ot', default='')
     parser.add_argument('--module-gene-ot', default='false')
@@ -771,7 +1006,6 @@ def main() -> None:
         raise ValueError("This script is the Stage2 naive joint implementation; --module-naive-joint must remain true.")
     unsupported_modules = {
         'platform_token': args.module_platform_token,
-        'shared_private': args.module_shared_private,
         'gene_completion': args.module_gene_completion,
         'cell_refine': args.module_cell_refine,
     }
@@ -813,6 +1047,12 @@ def main() -> None:
         args.pretrained,
         args.image_encoder_checkpoint,
         use_platform_token=args.module_platform_token,
+        use_shared_private=args.module_shared_private,
+        shared_private_dim=args.shared_private_dim,
+        private_dim=args.private_dim,
+        private_gate=args.private_gate,
+        shared_align_weight=args.shared_align_weight,
+        orth_weight=args.orth_weight,
         use_image_ot=args.module_image_ot,
         use_gene_ot=args.module_gene_ot,
         ot_transport=args.ot_transport,
@@ -858,6 +1098,11 @@ def main() -> None:
         module_naive_joint=args.module_naive_joint,
         module_platform_token=args.module_platform_token,
         module_shared_private=args.module_shared_private,
+        shared_private_dim=args.shared_private_dim,
+        private_dim=args.private_dim,
+        private_gate=args.private_gate,
+        shared_align_weight=args.shared_align_weight,
+        orth_weight=args.orth_weight,
         module_ot=args.module_ot,
         module_image_ot=args.module_image_ot,
         module_gene_ot=args.module_gene_ot,
@@ -891,6 +1136,11 @@ def main() -> None:
             'naive_joint': args.module_naive_joint,
             'platform_token': args.module_platform_token,
             'shared_private': args.module_shared_private,
+            'shared_private_dim': args.shared_private_dim,
+            'private_dim': args.private_dim,
+            'private_gate': args.private_gate,
+            'shared_align_weight': args.shared_align_weight,
+            'orth_weight': args.orth_weight,
             'ot': args.module_ot,
             'image_ot': args.module_image_ot,
             'gene_ot': args.module_gene_ot,
@@ -920,10 +1170,17 @@ def main() -> None:
             'joint_train_main_loss': float(train_stats['main_loss']),
             'joint_train_image_ot_loss': float(train_stats['image_ot_loss']),
             'joint_train_gene_ot_loss': float(train_stats['gene_ot_loss']),
+            'joint_train_shared_image_align_loss': float(train_stats['shared_image_align_loss']),
+            'joint_train_shared_gene_align_loss': float(train_stats['shared_gene_align_loss']),
+            'joint_train_orth_loss': float(train_stats['orth_loss']),
             'joint_train_image_ot_active_fraction': float(train_stats['image_ot_active_fraction']),
             'joint_train_gene_ot_active_fraction': float(train_stats['gene_ot_active_fraction']),
+            'joint_train_shared_image_align_active_fraction': float(train_stats['shared_image_align_active_fraction']),
+            'joint_train_shared_gene_align_active_fraction': float(train_stats['shared_gene_align_active_fraction']),
             'joint_train_image_ot_pairs_mean': float(train_stats['image_ot_pairs_mean']),
             'joint_train_gene_ot_pairs_mean': float(train_stats['gene_ot_pairs_mean']),
+            'joint_train_shared_image_align_pairs_mean': float(train_stats['shared_image_align_pairs_mean']),
+            'joint_train_shared_gene_align_pairs_mean': float(train_stats['shared_gene_align_pairs_mean']),
             'visium_val_loss': float(visium_val.avg),
             'xenium_val_loss': float(xenium_val.avg),
             'combined_val_loss': combined_val,

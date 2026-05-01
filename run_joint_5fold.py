@@ -50,6 +50,13 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=50)
     parser.add_argument("--retrieval-chunk-size", type=int, default=1024)
     parser.add_argument("--eval-bank-mode", default="target", choices=["target", "joint"])
+    parser.add_argument("--module-platform-token", default="false")
+    parser.add_argument("--module-shared-private", default="false")
+    parser.add_argument("--shared-private-dim", type=int, default=256)
+    parser.add_argument("--private-dim", type=int, default=64)
+    parser.add_argument("--private-gate", type=float, default=0.25)
+    parser.add_argument("--shared-align-weight", type=float, default=0.05)
+    parser.add_argument("--orth-weight", type=float, default=0.01)
     parser.add_argument("--module-image-ot", default="false")
     parser.add_argument("--module-gene-ot", default="false")
     parser.add_argument("--ot-transport", choices=["ot", "uot"], default="ot")
@@ -110,6 +117,20 @@ def main() -> None:
             str(args.retrieval_chunk_size),
             "--eval-bank-mode",
             args.eval_bank_mode,
+            "--module-platform-token",
+            str(args.module_platform_token),
+            "--module-shared-private",
+            str(args.module_shared_private),
+            "--shared-private-dim",
+            str(args.shared_private_dim),
+            "--private-dim",
+            str(args.private_dim),
+            "--private-gate",
+            str(args.private_gate),
+            "--shared-align-weight",
+            str(args.shared_align_weight),
+            "--orth-weight",
+            str(args.orth_weight),
             "--module-image-ot",
             str(args.module_image_ot),
             "--module-gene-ot",
