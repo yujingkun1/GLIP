@@ -1,0 +1,26 @@
+# Context Snapshot
+- task statement: Build and execute a staged experiment program for cross-platform BRCA spatial transcriptomics using HEST1k BRCA Visium samples (SPA119-SPA154), Xenium sample NCBI784, and GLIP/BLEEP-style code structure; proceed incrementally, adding one module or experiment block at a time, only advancing after surpassing the prior stage.
+- desired outcome: A reproducible phased experimental plan plus implementation workflow with strict train/test bookkeeping, per-stage logs, CSV ledger of all iterations, and git commits/pushes for major changes.
+- known facts/evidence:
+  - Visium scope fixed to HEST1k BRCA samples SPA119-SPA154.
+  - Xenium scope fixed to NCBI784 for the core cross-platform work.
+  - GLIP is the primary baseline reference; BLEEP and GLIP codebases should inform structure.
+  - User provided BRCA baseline numbers for GLIP and other methods on Visium.
+  - Progression rule: do not add the next module until the current stage clearly surpasses the previous stage under matched data splits.
+  - Every stage requires a detailed markdown record and a CSV summarizing all iterations/results.
+  - Major code changes require git commit and push.
+- constraints:
+  - Use breast cancer only for the core program.
+  - Keep train/test data identical across ablations within a stage.
+  - Emphasize generalization, not just mixed training performance.
+  - Continue in Chinese.
+- unknowns/open questions:
+  - Exact local availability/layout of SPA119-SPA154 and NCBI784 assets.
+  - Which external BRCA datasets are realistically downloadable via mirrors for generalization testing.
+  - Which repo will host the experiment implementation (likely new/target repo under /data/yujk).
+  - Whether remote GitHub push credentials are already configured.
+- likely codebase touchpoints:
+  - /data/yujk/GLIP
+  - /data/yujk/BLEEP
+  - /data/yujk/hovernet2feature/BiTro
+  - local HEST/Xenium data roots under /data/yujk/hovernet2feature or related storage

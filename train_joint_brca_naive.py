@@ -30,7 +30,7 @@ from glip.xenium.pseudospot import XeniumPseudoSpotDataset, build_pseudospot_out
 UNI_MODEL_NAME = "hf-hub:MahmoodLab/UNI2-h"
 MODEL_NAME_ALIASES = {"uni": UNI_MODEL_NAME, "uni2-h": UNI_MODEL_NAME}
 DEFAULT_VISIUM_SAMPLE_IDS = [f"SPA{i}" for i in range(119, 155)]
-DEFAULT_SHARED_GENE_FILE = "/data/yujk/GLIP/configs/brca_shared_genes_ncbi784_ref_spa124_313.txt"
+DEFAULT_SHARED_GENE_FILE = "/data/yujk/GLIP/configs/brca_shared_genes_ncbi784_visium36_intersection_227.txt"
 
 
 def parse_sample_ids(raw_sample_ids: str | Sequence[str] | None) -> List[str]:
@@ -41,10 +41,43 @@ def parse_sample_ids(raw_sample_ids: str | Sequence[str] | None) -> List[str]:
     return [str(sample_id).strip() for sample_id in raw_sample_ids if str(sample_id).strip()]
 
 
+def load_fixed_fold_manifest(manifest_path: str, fold_index: int) -> Dict:
+    with open(manifest_path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+
+    folds = payload.get("folds") if isinstance(payload, dict) else payload
+    if not isinstance(folds, list):
+        raise ValueError(f"Invalid fold manifest format: {manifest_path}")
+
+    for fold in folds:
+        if int(fold.get("fold_index", -1)) != int(fold_index):
+            continue
+        train_samples = parse_sample_ids(fold.get("train_samples"))
+        test_samples = parse_sample_ids(fold.get("test_samples"))
+        if not train_samples or not test_samples:
+            raise ValueError(f"Fold {fold_index} in {manifest_path} is missing train/test samples")
+        sample_ids = parse_sample_ids(payload.get("sample_ids")) if isinstance(payload, dict) else []
+        if not sample_ids:
+            sample_ids = sorted(set(train_samples + test_samples))
+        return {
+            "fold_index": int(fold_index),
+            "split_name": payload.get("split_name", os.path.basename(manifest_path)) if isinstance(payload, dict) else os.path.basename(manifest_path),
+            "sample_ids": sample_ids,
+            "train_samples": train_samples,
+            "test_samples": test_samples,
+        }
+
+    raise ValueError(f"Fold index {fold_index} not found in manifest: {manifest_path}")
+
+
 @dataclass
 class RunConfig:
     visium_heldout_sample: str
     visium_sample_ids: List[str]
+    visium_train_samples: List[str]
+    visium_test_samples: List[str]
+    visium_fold_manifest: str
+    visium_fold_index: int
     shared_gene_file: str
     xenium_sample_id: str
     xenium_reference_visium_sample_id: str
@@ -68,13 +101,29 @@ class RunConfig:
     max_visium_test_spots: int
     max_xenium_train_spots: int
     max_xenium_test_spots: int
+    eval_bank_mode: str
+    module_naive_joint: bool
+    module_platform_token: bool
+    module_shared_private: bool
+    module_ot: bool
+    module_image_ot: bool
+    module_gene_ot: bool
+    ot_transport: str
+    ot_image_weight: float
+    ot_gene_weight: float
+    ot_sinkhorn_eps: float
+    ot_sinkhorn_iters: int
+    uot_marginal_weight: float
+    module_gene_completion: bool
+    module_cell_refine: bool
     note: str
 
 
 class WrappedVisiumDataset(Dataset):
-    def __init__(self, dataset: Dataset, source_name: str) -> None:
+    def __init__(self, dataset: Dataset, source_name: str, platform_id: int = 0) -> None:
         self.dataset = dataset
         self.source_name = source_name
+        self.platform_id = int(platform_id)
         self.num_features = getattr(dataset, "num_features", None)
         self.num_genes = getattr(dataset, "num_genes", None)
 
@@ -84,13 +133,15 @@ class WrappedVisiumDataset(Dataset):
     def __getitem__(self, index: int) -> Dict:
         sample = self.dataset[index]
         sample["source"] = self.source_name
+        sample["platform_id"] = torch.tensor(self.platform_id, dtype=torch.long)
         return sample
 
 
 class WrappedXeniumPseudoSpotDataset(Dataset):
-    def __init__(self, dataset: XeniumPseudoSpotDataset, source_name: str) -> None:
+    def __init__(self, dataset: XeniumPseudoSpotDataset, source_name: str, platform_id: int = 1) -> None:
         self.dataset = dataset
         self.source_name = source_name
+        self.platform_id = int(platform_id)
         self.num_features = getattr(dataset, "num_features", None)
         self.num_genes = getattr(dataset, "num_features", None)
 
@@ -101,11 +152,12 @@ class WrappedXeniumPseudoSpotDataset(Dataset):
         sample = self.dataset[index]
         return {
             "image": sample["image"],
-            "reduced_expression": sample["expression"].float(),
+            "reduced_expression": sample["encoder_expression"].float(),
             "barcode": f"{self.source_name}_{int(sample['spot_id'])}",
             "sample_id": self.source_name,
             "spatial_coords": [float(sample["centroid_x"]), float(sample["centroid_y"])],
             "source": self.source_name,
+            "platform_id": torch.tensor(self.platform_id, dtype=torch.long),
         }
 
 
@@ -122,26 +174,271 @@ def create_loader(dataset: Dataset, batch_size: int, num_workers: int, shuffle: 
 
 
 def move_batch_to_device(batch, device: torch.device):
-    return {
+    moved = {
         "image": batch["image"].to(device, non_blocking=True),
         "reduced_expression": batch["reduced_expression"].to(device, non_blocking=True),
     }
+    if "platform_id" in batch:
+        moved["platform_id"] = batch["platform_id"].to(device, non_blocking=True)
+    return moved
 
 
-def train_epoch(model, train_loader: DataLoader, optimizer, device: torch.device) -> AvgMeter:
-    loss_meter = AvgMeter("train_loss")
+
+
+class PlatformConditionedModel(torch.nn.Module):
+    def __init__(
+        self,
+        base_model: torch.nn.Module,
+        use_platform_token: bool = False,
+        num_platforms: int = 2,
+        use_image_ot: bool = False,
+        use_gene_ot: bool = False,
+        ot_transport: str = "ot",
+        ot_image_weight: float = 0.0,
+        ot_gene_weight: float = 0.0,
+        ot_sinkhorn_eps: float = 0.05,
+        ot_sinkhorn_iters: int = 50,
+        uot_marginal_weight: float = 1.0,
+    ):
+        super().__init__()
+        self.base_model = base_model
+        self.use_platform_token = bool(use_platform_token)
+        self.use_image_ot = bool(use_image_ot)
+        self.use_gene_ot = bool(use_gene_ot)
+        self.ot_transport = str(ot_transport).strip().lower()
+        if self.ot_transport not in {"ot", "uot"}:
+            raise ValueError(f"Unsupported OT transport mode: {ot_transport}")
+        self.ot_image_weight = float(ot_image_weight)
+        self.ot_gene_weight = float(ot_gene_weight)
+        self.ot_sinkhorn_eps = float(ot_sinkhorn_eps)
+        self.ot_sinkhorn_iters = int(ot_sinkhorn_iters)
+        self.uot_marginal_weight = float(uot_marginal_weight)
+        self.temperature = getattr(base_model, "temperature")
+        projection_dim = int(base_model.image_projection.projection.out_features)
+        self.platform_token = torch.nn.Embedding(num_platforms, projection_dim) if self.use_platform_token else None
+
+    @property
+    def image_encoder(self):
+        return self.base_model.image_encoder
+
+    @property
+    def image_projection(self):
+        return self.base_model.image_projection
+
+    @property
+    def spot_projection(self):
+        return self.base_model.spot_projection
+
+    def _apply_platform_token(self, embeddings: torch.Tensor, platform_ids: torch.Tensor | None) -> torch.Tensor:
+        if self.platform_token is None or platform_ids is None:
+            return embeddings
+        return embeddings + self.platform_token(platform_ids)
+
+    def encode_images(self, images: torch.Tensor, platform_ids: torch.Tensor | None = None) -> torch.Tensor:
+        image_features = self.base_model.image_encoder(images)
+        image_embeddings = self.base_model.image_projection(image_features)
+        return self._apply_platform_token(image_embeddings, platform_ids)
+
+    def encode_spots(self, reduced_expression: torch.Tensor, platform_ids: torch.Tensor | None = None) -> torch.Tensor:
+        spot_embeddings = self.base_model.spot_projection(reduced_expression)
+        return self._apply_platform_token(spot_embeddings, platform_ids)
+
+    def compute_contrastive_loss(
+        self,
+        image_embeddings: torch.Tensor,
+        spot_embeddings: torch.Tensor,
+    ) -> torch.Tensor:
+        logits = (spot_embeddings @ image_embeddings.T) / self.temperature
+        images_similarity = image_embeddings @ image_embeddings.T
+        spots_similarity = spot_embeddings @ spot_embeddings.T
+        targets = F.softmax(((images_similarity + spots_similarity) / 2) / self.temperature, dim=-1)
+        spots_loss = F.cross_entropy(logits, targets, reduction='none') if targets.dtype in (torch.long, torch.int64) else (-targets * F.log_softmax(logits, dim=-1)).sum(1)
+        images_loss = F.cross_entropy(logits.T, targets.T, reduction='none') if targets.dtype in (torch.long, torch.int64) else (-targets.T * F.log_softmax(logits.T, dim=-1)).sum(1)
+        loss = (images_loss + spots_loss) / 2.0
+        return loss.mean()
+
+    def compute_embedding_ot_loss(
+        self,
+        embeddings: torch.Tensor,
+        platform_ids: torch.Tensor | None,
+        *,
+        enabled: bool,
+        weight: float,
+    ) -> tuple[torch.Tensor, int]:
+        zero = embeddings.new_zeros(())
+        if (
+            (not enabled)
+            or weight <= 0.0
+            or platform_ids is None
+            or embeddings.size(0) < 2
+        ):
+            return zero, 0
+
+        vis_mask = platform_ids == 0
+        xen_mask = platform_ids == 1
+        vis_count = int(vis_mask.sum().item())
+        xen_count = int(xen_mask.sum().item())
+        if vis_count == 0 or xen_count == 0:
+            return zero, 0
+
+        vis_embeddings = F.normalize(embeddings[vis_mask].float(), dim=1)
+        xen_embeddings = F.normalize(embeddings[xen_mask].float(), dim=1)
+        cost = 1.0 - torch.clamp(vis_embeddings @ xen_embeddings.T, min=-1.0, max=1.0)
+
+        num_vis = vis_embeddings.size(0)
+        num_xen = xen_embeddings.size(0)
+        a = torch.full((num_vis,), 1.0 / float(num_vis), device=embeddings.device, dtype=embeddings.dtype)
+        b = torch.full((num_xen,), 1.0 / float(num_xen), device=embeddings.device, dtype=embeddings.dtype)
+
+        if self.ot_transport == "uot":
+            return self.compute_embedding_uot_loss(cost, a, b), min(vis_count, xen_count)
+
+        return self.compute_embedding_balanced_ot_loss(cost, a, b), min(vis_count, xen_count)
+
+    def compute_embedding_balanced_ot_loss(
+        self,
+        cost: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+    ) -> torch.Tensor:
+        kernel = torch.exp(-cost / max(self.ot_sinkhorn_eps, 1e-6)).clamp_min(1e-8)
+        u = torch.ones_like(a)
+        v = torch.ones_like(b)
+
+        for _ in range(max(self.ot_sinkhorn_iters, 1)):
+            kv = kernel @ v
+            u = a / kv.clamp_min(1e-8)
+            ktu = kernel.T @ u
+            v = b / ktu.clamp_min(1e-8)
+
+        transport = u.unsqueeze(1) * kernel * v.unsqueeze(0)
+        return torch.sum(transport * cost)
+
+    def compute_embedding_uot_loss(
+        self,
+        cost: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+    ) -> torch.Tensor:
+        eps = max(self.ot_sinkhorn_eps, 1e-6)
+        rho = max(self.uot_marginal_weight, 1e-6)
+        tau = rho / (rho + eps)
+        kernel = torch.exp(-cost / eps).clamp_min(1e-8)
+        u = torch.ones_like(a)
+        v = torch.ones_like(b)
+
+        for _ in range(max(self.ot_sinkhorn_iters, 1)):
+            kv = kernel @ v
+            u = torch.pow(a / kv.clamp_min(1e-8), tau)
+            ktu = kernel.T @ u
+            v = torch.pow(b / ktu.clamp_min(1e-8), tau)
+
+        transport = u.unsqueeze(1) * kernel * v.unsqueeze(0)
+        row_mass = transport.sum(dim=1)
+        col_mass = transport.sum(dim=0)
+        marginal_penalty = rho * (
+            self.kl_divergence_with_reference(row_mass, a) +
+            self.kl_divergence_with_reference(col_mass, b)
+        )
+        return torch.sum(transport * cost) + marginal_penalty
+
+    def kl_divergence_with_reference(
+        self,
+        mass: torch.Tensor,
+        reference: torch.Tensor,
+    ) -> torch.Tensor:
+        mass = mass.clamp_min(1e-8)
+        reference = reference.clamp_min(1e-8)
+        return torch.sum(mass * (torch.log(mass) - torch.log(reference)) - mass + reference)
+
+    def compute_image_ot_loss(
+        self,
+        image_embeddings: torch.Tensor,
+        platform_ids: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, int]:
+        return self.compute_embedding_ot_loss(
+            image_embeddings,
+            platform_ids,
+            enabled=self.use_image_ot,
+            weight=self.ot_image_weight,
+        )
+
+    def compute_gene_ot_loss(
+        self,
+        spot_embeddings: torch.Tensor,
+        platform_ids: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, int]:
+        return self.compute_embedding_ot_loss(
+            spot_embeddings,
+            platform_ids,
+            enabled=self.use_gene_ot,
+            weight=self.ot_gene_weight,
+        )
+
+    def forward(self, batch: Dict[str, torch.Tensor], return_components: bool = False):
+        platform_ids = batch.get("platform_id")
+        image_embeddings = self.encode_images(batch["image"], platform_ids=platform_ids)
+        spot_embeddings = self.encode_spots(batch["reduced_expression"], platform_ids=platform_ids)
+        main_loss = self.compute_contrastive_loss(image_embeddings, spot_embeddings)
+        image_ot_loss, image_ot_pairs = self.compute_image_ot_loss(image_embeddings, platform_ids)
+        gene_ot_loss, gene_ot_pairs = self.compute_gene_ot_loss(spot_embeddings, platform_ids)
+        total_loss = main_loss + self.ot_image_weight * image_ot_loss + self.ot_gene_weight * gene_ot_loss
+        if not return_components:
+            return total_loss
+        return {
+            "total_loss": total_loss,
+            "main_loss": main_loss,
+            "image_ot_loss": image_ot_loss,
+            "gene_ot_loss": gene_ot_loss,
+            "image_ot_pairs": int(image_ot_pairs),
+            "gene_ot_pairs": int(gene_ot_pairs),
+        }
+
+
+def train_epoch(model, train_loader: DataLoader, optimizer, device: torch.device) -> Dict[str, float]:
+    total_loss_meter = AvgMeter("train_loss")
+    main_loss_meter = AvgMeter("main_loss")
+    image_ot_loss_meter = AvgMeter("image_ot_loss")
+    gene_ot_loss_meter = AvgMeter("gene_ot_loss")
+    image_ot_active_batch_meter = AvgMeter("image_ot_active_batches")
+    gene_ot_active_batch_meter = AvgMeter("gene_ot_active_batches")
+    image_ot_pairs_meter = AvgMeter("image_ot_pairs")
+    gene_ot_pairs_meter = AvgMeter("gene_ot_pairs")
     tqdm_object = tqdm(train_loader, total=len(train_loader), desc="joint_train")
     model.train()
     for batch in tqdm_object:
         moved = move_batch_to_device(batch, device)
-        loss = model(moved)
+        loss_components = model(moved, return_components=True)
+        loss = loss_components["total_loss"]
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
         count = moved["image"].size(0)
-        loss_meter.update(loss.item(), count)
-        tqdm_object.set_postfix(train_loss=loss_meter.avg, lr=get_lr(optimizer))
-    return loss_meter
+        total_loss_meter.update(float(loss_components["total_loss"].item()), count)
+        main_loss_meter.update(float(loss_components["main_loss"].item()), count)
+        image_ot_loss_meter.update(float(loss_components["image_ot_loss"].item()), count)
+        gene_ot_loss_meter.update(float(loss_components["gene_ot_loss"].item()), count)
+        image_ot_active_batch_meter.update(1.0 if int(loss_components["image_ot_pairs"]) > 0 else 0.0, 1)
+        gene_ot_active_batch_meter.update(1.0 if int(loss_components["gene_ot_pairs"]) > 0 else 0.0, 1)
+        image_ot_pairs_meter.update(float(loss_components["image_ot_pairs"]), 1)
+        gene_ot_pairs_meter.update(float(loss_components["gene_ot_pairs"]), 1)
+        tqdm_object.set_postfix(
+            total=total_loss_meter.avg,
+            main=main_loss_meter.avg,
+            img_ot=image_ot_loss_meter.avg,
+            gene_ot=gene_ot_loss_meter.avg,
+            lr=get_lr(optimizer),
+        )
+    return {
+        "total_loss": float(total_loss_meter.avg),
+        "main_loss": float(main_loss_meter.avg),
+        "image_ot_loss": float(image_ot_loss_meter.avg),
+        "gene_ot_loss": float(gene_ot_loss_meter.avg),
+        "image_ot_active_fraction": float(image_ot_active_batch_meter.avg),
+        "gene_ot_active_fraction": float(gene_ot_active_batch_meter.avg),
+        "image_ot_pairs_mean": float(image_ot_pairs_meter.avg),
+        "gene_ot_pairs_mean": float(gene_ot_pairs_meter.avg),
+    }
 
 
 def eval_loss(model, loader: DataLoader, device: torch.device, tag: str) -> AvgMeter:
@@ -180,7 +477,10 @@ def collect_spot_bank(model, loader: DataLoader, device: torch.device) -> Dict[s
     model.eval()
     for batch in loader:
         reduced_expression = batch["reduced_expression"].to(device, non_blocking=True)
-        spot_embeddings = model.spot_projection(reduced_expression)
+        platform_ids = batch.get("platform_id")
+        if platform_ids is not None:
+            platform_ids = platform_ids.to(device, non_blocking=True)
+        spot_embeddings = model.encode_spots(reduced_expression, platform_ids=platform_ids)
         embeddings.append(spot_embeddings.detach().cpu())
         expressions.append(batch["reduced_expression"].detach().cpu())
         sample_ids.extend(list(batch["sample_id"]))
@@ -202,8 +502,10 @@ def collect_image_queries(model, loader: DataLoader, device: torch.device) -> Di
     model.eval()
     for batch in loader:
         images = batch["image"].to(device, non_blocking=True)
-        image_features = model.image_encoder(images)
-        image_embeddings = model.image_projection(image_features)
+        platform_ids = batch.get("platform_id")
+        if platform_ids is not None:
+            platform_ids = platform_ids.to(device, non_blocking=True)
+        image_embeddings = model.encode_images(images, platform_ids=platform_ids)
         embeddings.append(image_embeddings.detach().cpu())
         expressions.append(batch["reduced_expression"].detach().cpu())
         sample_ids.extend(list(batch["sample_id"]))
@@ -259,21 +561,49 @@ def compute_metrics(predictions, targets):
     }
 
 
-def build_model(model_name: str, resolved_model_name: str, spot_embedding_dim: int, pretrained: bool, checkpoint_path: str):
+def build_model(
+    model_name: str,
+    resolved_model_name: str,
+    spot_embedding_dim: int,
+    pretrained: bool,
+    checkpoint_path: str,
+    use_platform_token: bool = False,
+    use_image_ot: bool = False,
+    use_gene_ot: bool = False,
+    ot_transport: str = "ot",
+    ot_image_weight: float = 0.0,
+    ot_gene_weight: float = 0.0,
+    ot_sinkhorn_eps: float = 0.05,
+    ot_sinkhorn_iters: int = 50,
+    uot_marginal_weight: float = 1.0,
+):
     choice = str(model_name).strip().lower()
     if choice == "clip":
-        return CLIPModel_CLIP(spot_embedding=spot_embedding_dim)
-    if choice == "vit":
-        return CLIPModel_ViT(spot_embedding=spot_embedding_dim)
-    if choice == "vit_l":
-        return CLIPModel_ViT_L(spot_embedding=spot_embedding_dim)
-    if choice == "resnet101":
-        return CLIPModel_resnet101(spot_embedding=spot_embedding_dim)
-    if choice == "resnet152":
-        return CLIPModel_resnet152(spot_embedding=spot_embedding_dim)
-    if choice == "uni" or resolved_model_name == UNI_MODEL_NAME:
-        return CLIPModel_UNI(spot_embedding=spot_embedding_dim, pretrained=pretrained, checkpoint_path=checkpoint_path)
-    return CLIPModel(spot_embedding=spot_embedding_dim, model_name=resolved_model_name, pretrained=pretrained, checkpoint_path=checkpoint_path)
+        base_model = CLIPModel_CLIP(spot_embedding=spot_embedding_dim)
+    elif choice == "vit":
+        base_model = CLIPModel_ViT(spot_embedding=spot_embedding_dim)
+    elif choice == "vit_l":
+        base_model = CLIPModel_ViT_L(spot_embedding=spot_embedding_dim)
+    elif choice == "resnet101":
+        base_model = CLIPModel_resnet101(spot_embedding=spot_embedding_dim)
+    elif choice == "resnet152":
+        base_model = CLIPModel_resnet152(spot_embedding=spot_embedding_dim)
+    elif choice == "uni" or resolved_model_name == UNI_MODEL_NAME:
+        base_model = CLIPModel_UNI(spot_embedding=spot_embedding_dim, pretrained=pretrained, checkpoint_path=checkpoint_path)
+    else:
+        base_model = CLIPModel(spot_embedding=spot_embedding_dim, model_name=resolved_model_name, pretrained=pretrained, checkpoint_path=checkpoint_path)
+    return PlatformConditionedModel(
+        base_model,
+        use_platform_token=use_platform_token,
+        use_image_ot=use_image_ot,
+        use_gene_ot=use_gene_ot,
+        ot_transport=ot_transport,
+        ot_image_weight=ot_image_weight,
+        ot_gene_weight=ot_gene_weight,
+        ot_sinkhorn_eps=ot_sinkhorn_eps,
+        ot_sinkhorn_iters=ot_sinkhorn_iters,
+        uot_marginal_weight=uot_marginal_weight,
+    )
 
 
 def resolve_model_name(model_name: str) -> str:
@@ -297,18 +627,33 @@ def build_visium_subsets(args, shared_gene_file: str):
         max_spots_per_sample=args.max_spots_per_sample,
         is_train=False,
     )
+    if args.visium_fold_manifest:
+        fold_payload = load_fixed_fold_manifest(args.visium_fold_manifest, args.visium_fold_index)
+        train_samples = fold_payload["train_samples"]
+        test_samples = fold_payload["test_samples"]
+        holdout_label = f"fold_{int(fold_payload['fold_index']):02d}"
+    else:
+        train_samples = [sample_id for sample_id in args.visium_sample_ids if sample_id != args.visium_heldout_sample]
+        test_samples = [args.visium_heldout_sample]
+        holdout_label = args.visium_heldout_sample
+
+    train_sample_set = set(train_samples)
+    test_sample_set = set(test_samples)
     train_indices = []
     test_indices = []
     for idx, entry in enumerate(dataset.entries):
-        if entry["sample_id"] == args.visium_heldout_sample:
+        sample_id = entry["sample_id"]
+        if sample_id in test_sample_set:
             test_indices.append(idx)
-        else:
+        elif sample_id in train_sample_set:
             train_indices.append(idx)
     train_indices = maybe_subset(np.asarray(train_indices, dtype=np.int64), args.max_visium_train_spots)
     test_indices = maybe_subset(np.asarray(test_indices, dtype=np.int64), args.max_visium_test_spots)
+    if len(train_indices) == 0:
+        raise RuntimeError(f"No train visium spots for split {holdout_label}")
     if len(test_indices) == 0:
-        raise RuntimeError(f"No test visium spots for heldout sample {args.visium_heldout_sample}")
-    return dataset, train_indices, test_indices
+        raise RuntimeError(f"No test visium spots for split {holdout_label}")
+    return dataset, train_indices, test_indices, train_samples, test_samples, holdout_label
 
 
 def build_xenium_datasets(args, shared_gene_file: str):
@@ -361,6 +706,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--pseudo-output-base-dir', default='/data/yujk/GLIP/processed/pseudospots')
     parser.add_argument('--visium-sample-ids', default=','.join(DEFAULT_VISIUM_SAMPLE_IDS))
     parser.add_argument('--visium-heldout-sample', default='SPA119')
+    parser.add_argument('--visium-fold-manifest', default='')
+    parser.add_argument('--visium-fold-index', type=int, default=-1)
     parser.add_argument('--xenium-sample-id', default='NCBI784')
     parser.add_argument('--xenium-reference-visium-sample-id', default='SPA124')
     parser.add_argument('--shared-gene-file', default=DEFAULT_SHARED_GENE_FILE)
@@ -373,7 +720,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--batch-size', type=int, default=4)
     parser.add_argument('--eval-batch-size', type=int, default=32)
     parser.add_argument('--num-workers', type=int, default=0)
-    parser.add_argument('--epochs', type=int, default=3)
+    parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--weight-decay', type=float, default=1e-3)
     parser.add_argument('--top-k', type=int, default=50)
@@ -385,30 +732,70 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--max-visium-test-spots', type=int, default=0)
     parser.add_argument('--max-xenium-train-spots', type=int, default=0)
     parser.add_argument('--max-xenium-test-spots', type=int, default=0)
-    parser.add_argument('--note', default='Stage2 minimal naive joint training on pooled Visium + Xenium pseudo-spots in a shared 313-gene space.')
+    parser.add_argument('--eval-bank-mode', choices=['target', 'joint'], default='target')
+    parser.add_argument('--module-naive-joint', default='true')
+    parser.add_argument('--module-platform-token', default='false')
+    parser.add_argument('--module-shared-private', default='false')
+    parser.add_argument('--module-ot', default='false')
+    parser.add_argument('--module-image-ot', default='')
+    parser.add_argument('--module-gene-ot', default='false')
+    parser.add_argument('--ot-transport', choices=['ot', 'uot'], default='ot')
+    parser.add_argument('--ot-image-weight', type=float, default=0.05)
+    parser.add_argument('--ot-gene-weight', type=float, default=0.05)
+    parser.add_argument('--ot-sinkhorn-eps', type=float, default=0.05)
+    parser.add_argument('--ot-sinkhorn-iters', type=int, default=50)
+    parser.add_argument('--uot-marginal-weight', type=float, default=1.0)
+    parser.add_argument('--module-gene-completion', default='false')
+    parser.add_argument('--module-cell-refine', default='false')
+    parser.add_argument('--note', default='Stage2 minimal naive joint training on pooled Visium + Xenium pseudo-spots in a shared 227-gene space.')
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     args.visium_sample_ids = parse_sample_ids(args.visium_sample_ids) or list(DEFAULT_VISIUM_SAMPLE_IDS)
+    args.visium_fold_manifest = os.path.abspath(os.path.expanduser(args.visium_fold_manifest.strip())) if args.visium_fold_manifest else ''
     args.pretrained = parse_bool(args.pretrained)
     args.resolved_model_name = resolve_model_name(args.model)
+    args.module_naive_joint = parse_bool(args.module_naive_joint)
+    args.module_platform_token = parse_bool(args.module_platform_token)
+    args.module_shared_private = parse_bool(args.module_shared_private)
+    args.module_ot = parse_bool(args.module_ot)
+    args.module_image_ot = parse_bool(args.module_image_ot) if str(args.module_image_ot).strip() else args.module_ot
+    args.module_gene_ot = parse_bool(args.module_gene_ot)
+    args.ot_transport = str(args.ot_transport).strip().lower()
+    args.module_gene_completion = parse_bool(args.module_gene_completion)
+    args.module_cell_refine = parse_bool(args.module_cell_refine)
+
+    if not args.module_naive_joint:
+        raise ValueError("This script is the Stage2 naive joint implementation; --module-naive-joint must remain true.")
+    unsupported_modules = {
+        'platform_token': args.module_platform_token,
+        'shared_private': args.module_shared_private,
+        'gene_completion': args.module_gene_completion,
+        'cell_refine': args.module_cell_refine,
+    }
+    enabled_unsupported = [name for name, enabled in unsupported_modules.items() if enabled and name != 'platform_token']
+    if enabled_unsupported:
+        raise NotImplementedError(
+            "The following module toggles are reserved for later stages and are not implemented in Stage2: "
+            + ", ".join(enabled_unsupported)
+        )
 
     os.makedirs(args.run_dir, exist_ok=True)
     seed_everything(args.seed)
     device = torch.device(args.device if args.device else ('cuda' if torch.cuda.is_available() else 'cpu'))
     print(f'Using device: {device}')
 
-    visium_dataset, vis_train_indices, vis_test_indices = build_visium_subsets(args, args.shared_gene_file)
+    visium_dataset, vis_train_indices, vis_test_indices, visium_train_samples, visium_test_samples, visium_holdout_label = build_visium_subsets(args, args.shared_gene_file)
     x_train_ds, x_train_eval_ds, x_test_ds, shared_genes = build_xenium_datasets(args, args.shared_gene_file)
 
-    vis_train = WrappedVisiumDataset(Subset(visium_dataset, vis_train_indices.tolist()), source_name='visium_train')
-    vis_train_eval = WrappedVisiumDataset(Subset(visium_dataset, vis_train_indices.tolist()), source_name='visium_train')
-    vis_test = WrappedVisiumDataset(Subset(visium_dataset, vis_test_indices.tolist()), source_name=f'visium_test_{args.visium_heldout_sample}')
-    xen_train = WrappedXeniumPseudoSpotDataset(x_train_ds, source_name='xenium_train')
-    xen_train_eval = WrappedXeniumPseudoSpotDataset(x_train_eval_ds, source_name='xenium_train')
-    xen_test = WrappedXeniumPseudoSpotDataset(x_test_ds, source_name=f'xenium_test_{args.xenium_sample_id}')
+    vis_train = WrappedVisiumDataset(Subset(visium_dataset, vis_train_indices.tolist()), source_name='visium_train', platform_id=0)
+    vis_train_eval = WrappedVisiumDataset(Subset(visium_dataset, vis_train_indices.tolist()), source_name='visium_train', platform_id=0)
+    vis_test = WrappedVisiumDataset(Subset(visium_dataset, vis_test_indices.tolist()), source_name=f'visium_test_{visium_holdout_label}', platform_id=0)
+    xen_train = WrappedXeniumPseudoSpotDataset(x_train_ds, source_name='xenium_train', platform_id=1)
+    xen_train_eval = WrappedXeniumPseudoSpotDataset(x_train_eval_ds, source_name='xenium_train', platform_id=1)
+    xen_test = WrappedXeniumPseudoSpotDataset(x_test_ds, source_name=f'xenium_test_{args.xenium_sample_id}', platform_id=1)
 
     combined_train = ConcatDataset([vis_train, xen_train])
     combined_train_eval = ConcatDataset([vis_train_eval, xen_train_eval])
@@ -419,12 +806,31 @@ def main() -> None:
     train_loader = create_loader(combined_train, args.batch_size, args.num_workers, shuffle=True)
     train_eval_loader = create_loader(combined_train_eval, args.eval_batch_size, args.num_workers, shuffle=False)
 
-    model = build_model(args.model, args.resolved_model_name, len(shared_genes), args.pretrained, args.image_encoder_checkpoint).to(device)
+    model = build_model(
+        args.model,
+        args.resolved_model_name,
+        len(shared_genes),
+        args.pretrained,
+        args.image_encoder_checkpoint,
+        use_platform_token=args.module_platform_token,
+        use_image_ot=args.module_image_ot,
+        use_gene_ot=args.module_gene_ot,
+        ot_transport=args.ot_transport,
+        ot_image_weight=args.ot_image_weight,
+        ot_gene_weight=args.ot_gene_weight,
+        ot_sinkhorn_eps=args.ot_sinkhorn_eps,
+        ot_sinkhorn_iters=args.ot_sinkhorn_iters,
+        uot_marginal_weight=args.uot_marginal_weight,
+    ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     config = RunConfig(
-        visium_heldout_sample=args.visium_heldout_sample,
+        visium_heldout_sample=visium_holdout_label,
         visium_sample_ids=args.visium_sample_ids,
+        visium_train_samples=visium_train_samples,
+        visium_test_samples=visium_test_samples,
+        visium_fold_manifest=args.visium_fold_manifest,
+        visium_fold_index=int(args.visium_fold_index),
         shared_gene_file=args.shared_gene_file,
         xenium_sample_id=args.xenium_sample_id,
         xenium_reference_visium_sample_id=args.xenium_reference_visium_sample_id,
@@ -448,6 +854,21 @@ def main() -> None:
         max_visium_test_spots=args.max_visium_test_spots,
         max_xenium_train_spots=args.max_xenium_train_spots,
         max_xenium_test_spots=args.max_xenium_test_spots,
+        eval_bank_mode=args.eval_bank_mode,
+        module_naive_joint=args.module_naive_joint,
+        module_platform_token=args.module_platform_token,
+        module_shared_private=args.module_shared_private,
+        module_ot=args.module_ot,
+        module_image_ot=args.module_image_ot,
+        module_gene_ot=args.module_gene_ot,
+        ot_transport=args.ot_transport,
+        ot_image_weight=args.ot_image_weight,
+        ot_gene_weight=args.ot_gene_weight,
+        ot_sinkhorn_eps=args.ot_sinkhorn_eps,
+        ot_sinkhorn_iters=args.ot_sinkhorn_iters,
+        uot_marginal_weight=args.uot_marginal_weight,
+        module_gene_completion=args.module_gene_completion,
+        module_cell_refine=args.module_cell_refine,
         note=args.note,
     )
     save_json(asdict(config), os.path.join(args.run_dir, 'joint_config.json'))
@@ -456,10 +877,32 @@ def main() -> None:
         'baseline_source': 'user-provided manual single-platform results',
         'shared_gene_count': len(shared_genes),
         'shared_gene_file': os.path.abspath(args.shared_gene_file),
+        'visium_holdout_label': visium_holdout_label,
+        'visium_fold_manifest': args.visium_fold_manifest,
+        'visium_fold_index': int(args.visium_fold_index),
+        'visium_train_samples': visium_train_samples,
+        'visium_test_samples': visium_test_samples,
         'visium_train_spots': len(vis_train),
         'visium_test_spots': len(vis_test),
         'xenium_train_spots': len(xen_train),
         'xenium_test_spots': len(xen_test),
+        'eval_bank_mode': args.eval_bank_mode,
+        'module_toggles': {
+            'naive_joint': args.module_naive_joint,
+            'platform_token': args.module_platform_token,
+            'shared_private': args.module_shared_private,
+            'ot': args.module_ot,
+            'image_ot': args.module_image_ot,
+            'gene_ot': args.module_gene_ot,
+            'ot_transport': args.ot_transport,
+            'ot_image_weight': args.ot_image_weight,
+            'ot_gene_weight': args.ot_gene_weight,
+            'ot_sinkhorn_eps': args.ot_sinkhorn_eps,
+            'ot_sinkhorn_iters': args.ot_sinkhorn_iters,
+            'uot_marginal_weight': args.uot_marginal_weight,
+            'gene_completion': args.module_gene_completion,
+            'cell_refine': args.module_cell_refine,
+        },
         'no_extra_datasets_used': True,
     }, os.path.join(args.run_dir, 'split_manifest.json'))
 
@@ -473,7 +916,14 @@ def main() -> None:
         combined_val = float((visium_val.avg + xenium_val.avg) / 2.0)
         epoch_record = {
             'epoch': epoch,
-            'joint_train_loss': float(train_stats.avg),
+            'joint_train_loss': float(train_stats['total_loss']),
+            'joint_train_main_loss': float(train_stats['main_loss']),
+            'joint_train_image_ot_loss': float(train_stats['image_ot_loss']),
+            'joint_train_gene_ot_loss': float(train_stats['gene_ot_loss']),
+            'joint_train_image_ot_active_fraction': float(train_stats['image_ot_active_fraction']),
+            'joint_train_gene_ot_active_fraction': float(train_stats['gene_ot_active_fraction']),
+            'joint_train_image_ot_pairs_mean': float(train_stats['image_ot_pairs_mean']),
+            'joint_train_gene_ot_pairs_mean': float(train_stats['gene_ot_pairs_mean']),
             'visium_val_loss': float(visium_val.avg),
             'xenium_val_loss': float(xenium_val.avg),
             'combined_val_loss': combined_val,
@@ -495,8 +945,17 @@ def main() -> None:
     vis_queries = collect_image_queries(model, vis_test_loader, device)
     xen_queries = collect_image_queries(model, xen_test_loader, device)
 
-    vis_predictions = predict_expression_from_retrieval(visium_bank, vis_queries, top_k=args.top_k, chunk_size=args.retrieval_chunk_size)
-    xen_predictions = predict_expression_from_retrieval(xenium_bank, xen_queries, top_k=args.top_k, chunk_size=args.retrieval_chunk_size)
+    if args.eval_bank_mode == 'target':
+        visium_primary_bank = visium_bank
+        xenium_primary_bank = xenium_bank
+    elif args.eval_bank_mode == 'joint':
+        visium_primary_bank = joint_bank
+        xenium_primary_bank = joint_bank
+    else:
+        raise ValueError(f"Unsupported eval bank mode: {args.eval_bank_mode}")
+
+    vis_predictions = predict_expression_from_retrieval(visium_primary_bank, vis_queries, top_k=args.top_k, chunk_size=args.retrieval_chunk_size)
+    xen_predictions = predict_expression_from_retrieval(xenium_primary_bank, xen_queries, top_k=args.top_k, chunk_size=args.retrieval_chunk_size)
     vis_predictions_joint_bank = predict_expression_from_retrieval(joint_bank, vis_queries, top_k=args.top_k, chunk_size=args.retrieval_chunk_size)
     xen_predictions_joint_bank = predict_expression_from_retrieval(joint_bank, xen_queries, top_k=args.top_k, chunk_size=args.retrieval_chunk_size)
 
@@ -506,11 +965,13 @@ def main() -> None:
     xen_joint_bank_metrics = compute_metrics(xen_predictions_joint_bank, xen_queries['expressions'].numpy())
     vis_metrics['top_k'] = int(args.top_k)
     xen_metrics['top_k'] = int(args.top_k)
-    vis_metrics['heldout_sample'] = args.visium_heldout_sample
+    vis_metrics['heldout_sample'] = visium_holdout_label
+    vis_metrics['heldout_samples'] = visium_test_samples
     xen_metrics['xenium_sample_id'] = args.xenium_sample_id
     vis_joint_bank_metrics['top_k'] = int(args.top_k)
     xen_joint_bank_metrics['top_k'] = int(args.top_k)
-    vis_joint_bank_metrics['heldout_sample'] = args.visium_heldout_sample
+    vis_joint_bank_metrics['heldout_sample'] = visium_holdout_label
+    vis_joint_bank_metrics['heldout_samples'] = visium_test_samples
     xen_joint_bank_metrics['xenium_sample_id'] = args.xenium_sample_id
 
     summary = {
@@ -521,6 +982,7 @@ def main() -> None:
         'visium_bank_size': int(visium_bank['embeddings'].shape[0]),
         'xenium_bank_size': int(xenium_bank['embeddings'].shape[0]),
         'joint_bank_size': int(joint_bank['embeddings'].shape[0]),
+        'eval_bank_mode': args.eval_bank_mode,
         'visium_test_metrics': vis_metrics,
         'xenium_test_metrics': xen_metrics,
         'visium_test_metrics_joint_bank': vis_joint_bank_metrics,

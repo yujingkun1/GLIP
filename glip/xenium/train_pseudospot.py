@@ -56,6 +56,21 @@ def resolve_scfoundation_gene_list_path(repo_dir: str) -> str:
     raise FileNotFoundError(f"Unable to find scFoundation reference gene list under {repo_dir}")
 
 
+def load_gene_names_from_text_file(path: str) -> List[str]:
+    genes: List[str] = []
+    seen = set()
+    with open(path, "r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            gene = raw_line.strip()
+            if not gene or gene in seen:
+                continue
+            seen.add(gene)
+            genes.append(gene)
+    if not genes:
+        raise RuntimeError(f"No genes found in gene file: {path}")
+    return genes
+
+
 def move_batch_to_device(batch: Dict, device: torch.device) -> Dict:
     moved = {}
     for key, value in batch.items():
@@ -87,7 +102,7 @@ def collect_embeddings(
                 expressions_batch = batch.get("encoder_expression", batch["expression"]).to(device, non_blocking=True)
                 batch_embeddings = model.encode_genes(expressions_batch)
             embeddings.append(batch_embeddings.detach().cpu())
-            expressions.append(batch["expression"].detach().cpu())
+            expressions.append(batch.get("encoder_expression", batch["expression"]).detach().cpu())
             spot_ids.append(torch.as_tensor(batch["cell_id"], dtype=torch.int64))
 
     return {
@@ -184,6 +199,11 @@ def parse_args() -> argparse.Namespace:
         help="HEST Visium/ST root directory",
     )
     parser.add_argument("--processed-dir", default="/data/yujk/GLIP/processed", help="Processed Xenium cell cache directory")
+    parser.add_argument(
+        "--gene-file",
+        default="/data/yujk/GLIP/configs/brca_shared_genes_ncbi784_visium36_intersection_227.txt",
+        help="Optional gene list file for projection gene encoder, one gene per line",
+    )
     parser.add_argument(
         "--pseudo-output-base-dir",
         default="/data/yujk/GLIP/processed/pseudospots",
@@ -285,6 +305,7 @@ def main() -> None:
     args.scfoundation_repo_dir = os.path.abspath(os.path.expanduser(args.scfoundation_repo_dir.strip()))
     args.scfoundation_checkpoint = os.path.abspath(os.path.expanduser(args.scfoundation_checkpoint.strip())) if args.scfoundation_checkpoint else ""
     args.scfoundation_key = args.scfoundation_key.strip()
+    args.gene_file = os.path.abspath(os.path.expanduser(args.gene_file.strip())) if args.gene_file else ""
     configure_hf_hub(args)
 
     if args.image_encoder_checkpoint and not os.path.exists(args.image_encoder_checkpoint):
@@ -292,6 +313,9 @@ def main() -> None:
     if args.image_encoder_checkpoint and args.pretrained:
         print("Local image encoder checkpoint provided; disabling remote pretrained download.")
         args.pretrained = False
+
+    if args.gene_file and not os.path.exists(args.gene_file):
+        raise FileNotFoundError(f"Gene file not found: {args.gene_file}")
 
     if args.gene_encoder == "scfoundation":
         if not os.path.isdir(args.scfoundation_repo_dir):
@@ -330,10 +354,15 @@ def main() -> None:
 
     if args.gene_encoder == "scfoundation":
         encoder_target_gene_names = load_gene_names_from_tsv(resolve_scfoundation_gene_list_path(args.scfoundation_repo_dir))
+        if args.gene_file:
+            print("Warning: --gene-file is ignored when --gene-encoder scfoundation is used.")
         encoder_use_raw_counts = True
     else:
-        with open(pseudospot_paths.genes_path, "r", encoding="utf-8") as handle:
-            encoder_target_gene_names = list(json.load(handle)["genes"])
+        if args.gene_file:
+            encoder_target_gene_names = load_gene_names_from_text_file(args.gene_file)
+        else:
+            with open(pseudospot_paths.genes_path, "r", encoding="utf-8") as handle:
+                encoder_target_gene_names = list(json.load(handle)["genes"])
         encoder_use_raw_counts = False
 
     train_dataset = XeniumPseudoSpotDataset(

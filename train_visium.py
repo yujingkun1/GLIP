@@ -34,6 +34,8 @@ MODEL_NAME_ALIASES = {
     "uni2-h": UNI_MODEL_NAME,
 }
 
+DEFAULT_VISIUM_GENE_FILE = "/data/yujk/GLIP/configs/brca_shared_genes_ncbi784_visium36_intersection_227.txt"
+
 
 parser = argparse.ArgumentParser(description="Train the Visium/ST-level BLEEP model inside GLIP")
 
@@ -44,7 +46,10 @@ parser.add_argument("--num_workers", type=int, default=8, help="data loader work
 
 parser.add_argument("--hest_data_dir", type=str, default="/data/yujk/hovernet2feature/HEST/hest_data", help="HEST root directory")
 parser.add_argument("--sample_ids", type=str, default="", help="comma-separated HEST sample ids; empty uses the default SPA leave-one-out panel")
-parser.add_argument("--gene_file", type=str, default="", help="optional gene list file, one gene per line")
+parser.add_argument("--cv_mode", type=str, default="leave_one_out", choices=["leave_one_out", "fixed_manifest"], help="cross-validation mode")
+parser.add_argument("--fold_manifest", type=str, default="", help="optional fixed fold manifest JSON for cv_mode=fixed_manifest")
+parser.add_argument("--fold_index", type=int, default=-1, help="fold index inside fold_manifest for cv_mode=fixed_manifest")
+parser.add_argument("--gene_file", type=str, default=DEFAULT_VISIUM_GENE_FILE, help="gene list file, one gene per line")
 parser.add_argument("--max_spots_per_sample", type=int, default=0, help="optional cap for spots per sample, 0 means no cap")
 parser.add_argument("--top_k", type=int, default=50, help="top-k retrieved training spots used to predict each test spot")
 parser.add_argument("--retrieval_chunk_size", type=int, default=1024, help="query chunk size used during retrieval evaluation")
@@ -118,6 +123,33 @@ def resolve_cv_sample_ids(args):
     return list(DEFAULT_LOO_SAMPLE_IDS)
 
 
+def load_fixed_fold_manifest(manifest_path, fold_index):
+    with open(manifest_path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+
+    folds = payload.get("folds") if isinstance(payload, dict) else payload
+    if not isinstance(folds, list):
+        raise ValueError(f"Invalid fold manifest format: {manifest_path}")
+
+    for fold in folds:
+        if int(fold.get("fold_index", -1)) == int(fold_index):
+            train_samples = parse_sample_ids(fold.get("train_samples"))
+            test_samples = parse_sample_ids(fold.get("test_samples"))
+            if not train_samples or not test_samples:
+                raise ValueError(f"Fold {fold_index} in {manifest_path} is missing train/test samples")
+            sample_ids = parse_sample_ids(payload.get("sample_ids")) if isinstance(payload, dict) else []
+            if not sample_ids:
+                sample_ids = sorted(set(train_samples + test_samples))
+            return {
+                "fold_index": int(fold_index),
+                "sample_ids": sample_ids,
+                "train_samples": train_samples,
+                "test_samples": test_samples,
+                "split_name": payload.get("split_name", os.path.basename(manifest_path)) if isinstance(payload, dict) else os.path.basename(manifest_path),
+            }
+    raise ValueError(f"Fold index {fold_index} not found in manifest: {manifest_path}")
+
+
 def save_json(payload, output_path):
     with open(output_path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
@@ -162,20 +194,23 @@ def build_base_dataset(args, sample_ids):
     return dataset
 
 
-def build_fold_loaders(args, base_dataset, heldout_sample):
+def build_fold_loaders(args, base_dataset, test_samples):
     train_indices = []
     test_indices = []
+    test_samples = set(parse_sample_ids(test_samples))
+    if not test_samples:
+        raise RuntimeError("At least one test sample is required to build a fold.")
 
     for idx, entry in enumerate(base_dataset.entries):
-        if entry["sample_id"] == heldout_sample:
+        if entry["sample_id"] in test_samples:
             test_indices.append(idx)
         else:
             train_indices.append(idx)
 
     if not train_indices:
-        raise RuntimeError(f"No training spots available for held-out sample {heldout_sample}")
+        raise RuntimeError(f"No training spots available for held-out samples {sorted(test_samples)}")
     if not test_indices:
-        raise RuntimeError(f"No test spots available for held-out sample {heldout_sample}")
+        raise RuntimeError(f"No test spots available for held-out samples {sorted(test_samples)}")
 
     train_dataset = CLIPSubset(base_dataset, train_indices, is_train=True)
     train_eval_dataset = CLIPSubset(base_dataset, train_indices, is_train=False)
@@ -613,9 +648,18 @@ def main():
     CFG.model_name = args.resolved_model_name
     CFG.image_encoder_checkpoint = args.image_encoder_checkpoint
 
-    sample_ids = resolve_cv_sample_ids(args)
-    if len(sample_ids) < 2:
-        raise RuntimeError("Leave-one-out requires at least two samples.")
+    if args.cv_mode == "fixed_manifest":
+        if not args.fold_manifest:
+            raise RuntimeError("--fold_manifest is required when --cv_mode fixed_manifest is used.")
+        if args.fold_index < 0:
+            raise RuntimeError("--fold_index must be >= 0 when --cv_mode fixed_manifest is used.")
+        cv_setup = load_fixed_fold_manifest(args.fold_manifest, args.fold_index)
+        sample_ids = cv_setup["sample_ids"]
+    else:
+        cv_setup = None
+        sample_ids = resolve_cv_sample_ids(args)
+        if len(sample_ids) < 2:
+            raise RuntimeError("Leave-one-out requires at least two samples.")
 
     if rank == 0:
         if args.hf_endpoint:
@@ -627,8 +671,10 @@ def main():
         os.makedirs(args.exp_name, exist_ok=True)
         save_json(
             {
-                "cv_mode": "leave_one_out",
+                "cv_mode": args.cv_mode,
                 "sample_ids": sample_ids,
+                "fold_manifest": args.fold_manifest or None,
+                "fold_index": int(args.fold_index),
                 "gene_file": args.gene_file or None,
                 "model": args.model,
                 "resolved_model_name": args.resolved_model_name,
@@ -639,6 +685,7 @@ def main():
                 "hf_endpoint": args.hf_endpoint or None,
                 "hf_hub_download_timeout": int(args.hf_hub_download_timeout),
                 "hf_hub_etag_timeout": int(args.hf_hub_etag_timeout),
+                "fixed_manifest_split": cv_setup if cv_setup is not None else None,
             },
             os.path.join(args.exp_name, "cv_config.json"),
         )
@@ -650,8 +697,10 @@ def main():
 
     all_fold_metrics = []
     completed_folds = {}
-    completed_metrics_path = os.path.join(args.exp_name, "loo_fold_metrics.json")
-    if rank == 0 and os.path.exists(completed_metrics_path):
+    metrics_list_name = "loo_fold_metrics.json" if args.cv_mode == "leave_one_out" else "cv_fold_metrics.json"
+    summary_name = "loo_summary.json" if args.cv_mode == "leave_one_out" else "cv_summary.json"
+    completed_metrics_path = os.path.join(args.exp_name, metrics_list_name)
+    if args.cv_mode == "leave_one_out" and rank == 0 and os.path.exists(completed_metrics_path):
         try:
             existing_metrics = json.load(open(completed_metrics_path, "r", encoding="utf-8"))
             if isinstance(existing_metrics, list):
@@ -668,36 +717,61 @@ def main():
         except Exception as exc:
             print(f"Warning: failed to load existing fold metrics from {completed_metrics_path}: {exc}")
 
-    for fold_idx, heldout_sample in enumerate(sample_ids):
-        train_samples = [sample_id for sample_id in sample_ids if sample_id != heldout_sample]
-        fold_name = f"fold_{fold_idx:02d}_{heldout_sample}"
+    if args.cv_mode == "fixed_manifest":
+        fold_jobs = [
+            {
+                "fold_idx": int(cv_setup["fold_index"]),
+                "test_samples": list(cv_setup["test_samples"]),
+                "train_samples": list(cv_setup["train_samples"]),
+                "fold_name": f"fold_{int(cv_setup['fold_index']):02d}",
+                "display_name": ",".join(cv_setup["test_samples"]),
+            }
+        ]
+    else:
+        fold_jobs = [
+            {
+                "fold_idx": int(fold_idx),
+                "test_samples": [heldout_sample],
+                "train_samples": [sample_id for sample_id in sample_ids if sample_id != heldout_sample],
+                "fold_name": f"fold_{fold_idx:02d}_{heldout_sample}",
+                "display_name": heldout_sample,
+            }
+            for fold_idx, heldout_sample in enumerate(sample_ids)
+        ]
+
+    for job_idx, fold_job in enumerate(fold_jobs):
+        fold_idx = int(fold_job["fold_idx"])
+        test_samples = list(fold_job["test_samples"])
+        train_samples = list(fold_job["train_samples"])
+        display_name = str(fold_job["display_name"])
+        fold_name = str(fold_job["fold_name"])
         fold_dir = os.path.join(args.exp_name, fold_name)
         best_model_path = os.path.join(fold_dir, "best.pt")
 
         if rank == 0:
-            if heldout_sample in completed_folds:
+            if args.cv_mode == "leave_one_out" and display_name in completed_folds:
                 print("")
-                print(f"=== Fold {fold_idx + 1}/{len(sample_ids)} ===")
-                print(f"Held-out sample: {heldout_sample}")
+                print(f"=== Fold {job_idx + 1}/{len(fold_jobs)} ===")
+                print(f"Held-out sample: {display_name}")
                 print("Skipping fold because pearson_metrics already exist in loo_fold_metrics.json")
                 continue
             os.makedirs(fold_dir, exist_ok=True)
             print("")
-            print(f"=== Fold {fold_idx + 1}/{len(sample_ids)} ===")
-            print(f"Held-out sample: {heldout_sample}")
+            print(f"=== Fold {job_idx + 1}/{len(fold_jobs)} ===")
+            print(f"Held-out sample(s): {display_name}")
             print(f"Train sample count: {len(train_samples)}")
 
         train_loader, train_eval_loader, test_loader, train_dataset, test_dataset = build_fold_loaders(
             args=args,
             base_dataset=base_dataset,
-            heldout_sample=heldout_sample,
+            test_samples=test_samples,
         )
 
         if rank == 0:
             print(f"Train spots: {len(train_dataset)}")
             print(f"Test spots: {len(test_dataset)}")
 
-        print(f"From Rank: {rank}, ==> Making model for {heldout_sample}..")
+        print(f"From Rank: {rank}, ==> Making model for {display_name}..")
         model = build_model(args, spot_embedding_dim).to(device)
 
         if args.distributed:
@@ -742,7 +816,7 @@ def main():
         if rank == 0:
             save_fold_training_artifacts(
                 fold_dir=fold_dir,
-                heldout_sample=heldout_sample,
+                heldout_sample=display_name,
                 train_losses=train_loss_history,
                 test_losses=test_loss_history,
             )
@@ -760,7 +834,8 @@ def main():
                 retrieval_chunk_size=args.retrieval_chunk_size,
             )
             fold_metrics["fold_idx"] = int(fold_idx)
-            fold_metrics["heldout_sample"] = heldout_sample
+            fold_metrics["heldout_sample"] = display_name
+            fold_metrics["heldout_samples"] = test_samples
             fold_metrics["train_samples"] = train_samples
             fold_metrics["num_train_spots"] = int(len(train_dataset))
             fold_metrics["num_test_spots"] = int(len(test_dataset))
@@ -772,10 +847,10 @@ def main():
 
             save_json(fold_metrics, os.path.join(fold_dir, "pearson_metrics.json"))
             all_fold_metrics.append(fold_metrics)
-            save_json(all_fold_metrics, os.path.join(args.exp_name, "loo_fold_metrics.json"))
+            save_json(all_fold_metrics, os.path.join(args.exp_name, metrics_list_name))
 
             print(
-                f"Fold {fold_idx + 1} Pearson: overall={fold_metrics['overall_pearson']:.6f}, "
+                f"Fold {job_idx + 1} Pearson: overall={fold_metrics['overall_pearson']:.6f}, "
                 f"gene={fold_metrics['mean_gene_pearson']:.6f}, "
                 f"spot={fold_metrics['mean_spot_pearson']:.6f}"
             )
@@ -787,9 +862,9 @@ def main():
     if rank == 0:
         summary = summarize_fold_metrics(all_fold_metrics)
         summary["folds"] = all_fold_metrics
-        save_json(summary, os.path.join(args.exp_name, "loo_summary.json"))
+        save_json(summary, os.path.join(args.exp_name, summary_name))
         print("")
-        print("=== Leave-One-Out Summary ===")
+        print("=== CV Summary ===")
         print(f"Average overall Pearson: {summary['average_overall_pearson']:.6f} ± {summary['std_overall_pearson']:.6f}")
         print(
             f"Average mean gene Pearson: {summary['average_mean_gene_pearson']:.6f} ± "

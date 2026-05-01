@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="520" viewBox="0 0 900 520">
+  <rect x="0" y="0" width="900" height="520" fill="white" />
+  <text x="450.00" y="32" font-size="22" text-anchor="middle" font-family="Arial, sans-serif">Loss Curve - SPA130</text>
+  <line x1='80' y1='450.00' x2='870' y2='450.00' stroke='#d9dde3' stroke-width='1' /><line x1='80' y1='372.00' x2='870' y2='372.00' stroke='#d9dde3' stroke-width='1' /><line x1='80' y1='294.00' x2='870' y2='294.00' stroke='#d9dde3' stroke-width='1' /><line x1='80' y1='216.00' x2='870' y2='216.00' stroke='#d9dde3' stroke-width='1' /><line x1='80' y1='138.00' x2='870' y2='138.00' stroke='#d9dde3' stroke-width='1' /><line x1='80' y1='60.00' x2='870' y2='60.00' stroke='#d9dde3' stroke-width='1' />
+  <line x1="80" y1="450" x2="870" y2="450" stroke="#222" stroke-width="2" />
+  <line x1="80" y1="60" x2="80" y2="450" stroke="#222" stroke-width="2" />
+  <text x='68' y='454.00' font-size='12' text-anchor='end'>0.5404</text><text x='68' y='376.00' font-size='12' text-anchor='end'>0.9763</text><text x='68' y='298.00' font-size='12' text-anchor='end'>1.4122</text><text x='68' y='220.00' font-size='12' text-anchor='end'>1.8481</text><text x='68' y='142.00' font-size='12' text-anchor='end'>2.2839</text><text x='68' y='64.00' font-size='12' text-anchor='end'>2.7198</text>
+  <text x='80.00' y='478' font-size='12' text-anchor='middle'>1</text><text x='167.78' y='478' font-size='12' text-anchor='middle'>2</text><text x='255.56' y='478' font-size='12' text-anchor='middle'>3</text><text x='343.33' y='478' font-size='12' text-anchor='middle'>4</text><text x='431.11' y='478' font-size='12' text-anchor='middle'>5</text><text x='518.89' y='478' font-size='12' text-anchor='middle'>6</text><text x='606.67' y='478' font-size='12' text-anchor='middle'>7</text><text x='694.44' y='478' font-size='12' text-anchor='middle'>8</text><text x='782.22' y='478' font-size='12' text-anchor='middle'>9</text><text x='870.00' y='478' font-size='12' text-anchor='middle'>10</text>
+  <text x="450.00" y="502" font-size="14" text-anchor="middle" font-family="Arial, sans-serif">Epoch</text>
+  <text x="22" y="260.00" font-size="14" text-anchor="middle" transform="rotate(-90 22 260.00)" font-family="Arial, sans-serif">Loss</text>
+  <polyline fill="none" stroke="#1f77b4" stroke-width="3" points="80.00,71.72 167.78,312.20 255.56,358.74 343.33,385.27 431.11,402.67 518.89,416.19 606.67,428.12 694.44,437.58 782.22,445.82 870.00,450.00" />
+  <polyline fill="none" stroke="#d62728" stroke-width="3" points="80.00,60.00 167.78,69.18 255.56,86.98 343.33,66.57 431.11,89.99 518.89,102.50 606.67,109.35 694.44,96.12 782.22,96.45 870.00,118.19" />
+  <rect x="680" y="74" width="16" height="16" fill="#1f77b4" />
+  <text x="704" y="87" font-size="13" font-family="Arial, sans-serif">Train Loss</text>
+  <rect x="680" y="102" width="16" height="16" fill="#d62728" />
+  <text x="704" y="115" font-size="13" font-family="Arial, sans-serif">Test Loss</text>
+</svg>

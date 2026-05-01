@@ -1,0 +1,45 @@
+Using device: cuda:1
+=== Initializing HEST-backed BLEEP dataset ===
+HEST root: /data/yujk/hovernet2feature/HEST/hest_data
+Samples requested: 36
+Using gene list from file: /data/yujk/GLIP/configs/brca_shared_genes_ncbi784_ref_spa124_313.txt
+Selected genes from file: 313
+[HEST] SPA119: matched 510 spots, genes present 290/313
+[HEST] SPA120: matched 602 spots, genes present 292/313
+[HEST] SPA121: matched 613 spots, genes present 300/313
+[HEST] SPA122: matched 463 spots, genes present 293/313
+[HEST] SPA123: matched 462 spots, genes present 292/313
+[HEST] SPA124: matched 440 spots, genes present 294/313
+[HEST] SPA125: matched 712 spots, genes present 287/313
+[HEST] SPA126: matched 695 spots, genes present 290/313
+[HEST] SPA127: matched 691 spots, genes present 285/313
+[HEST] SPA128: matched 570 spots, genes present 287/313
+[HEST] SPA129: matched 572 spots, genes present 283/313
+[HEST] SPA130: matched 587 spots, genes present 289/313
+[HEST] SPA131: matched 315 spots, genes present 290/313
+[HEST] SPA132: matched 306 spots, genes present 292/313
+[HEST] SPA133: matched 302 spots, genes present 294/313
+[HEST] SPA134: matched 301 spots, genes present 291/313
+[HEST] SPA135: matched 303 spots, genes present 290/313
+[HEST] SPA136: matched 306 spots, genes present 293/313
+[HEST] SPA137: matched 178 spots, genes present 294/313
+[HEST] SPA138: matched 181 spots, genes present 291/313
+[HEST] SPA139: matched 184 spots, genes present 293/313
+[HEST] SPA140: matched 180 spots, genes present 290/313
+[HEST] SPA141: matched 187 spots, genes present 290/313
+[HEST] SPA142: matched 176 spots, genes present 288/313
+[HEST] SPA143: matched 277 spots, genes present 299/313
+[HEST] SPA144: matched 289 spots, genes present 296/313
+[HEST] SPA145: matched 283 spots, genes present 298/313
+[HEST] SPA146: matched 298 spots, genes present 296/313
+[HEST] SPA147: matched 269 spots, genes present 299/313
+[HEST] SPA148: matched 295 spots, genes present 294/313
+[HEST] SPA149: matched 360 spots, genes present 288/313
+[HEST] SPA150: matched 332 spots, genes present 292/313
+[HEST] SPA151: matched 343 spots, genes present 288/313
+[HEST] SPA152: matched 359 spots, genes present 286/313
+[HEST] SPA153: matched 325 spots, genes present 292/313
+[HEST] SPA154: matched 346 spots, genes present 278/313
+[HEST] Total aligned spots across samples: 13612
+HEST aligned spots: 13612
+HEST gene dimension: 313
