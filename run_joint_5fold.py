@@ -18,6 +18,15 @@ DEFAULT_CHECKPOINT = "/data/yujk/BLEEP/checkpoints/resnet50_a1_0-14fe96d1.pth"
 TRAIN_SCRIPT = "/data/yujk/GLIP/train_joint_brca_naive.py"
 
 
+def parse_bool(value) -> bool:
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"Cannot parse bool from {value!r}")
+
+
 def summarize(metrics_list: List[Dict]) -> Dict:
     overall = [float(item["overall_pearson"]) for item in metrics_list]
     mean_gene = [float(item["mean_gene_pearson"]) for item in metrics_list]
@@ -69,6 +78,14 @@ def main() -> None:
     parser.add_argument("--ot-gene-weight", type=float, default=0.05)
     parser.add_argument("--uot-marginal-weight", type=float, default=1.0)
     args = parser.parse_args()
+
+    module_shared_private = parse_bool(args.module_shared_private)
+    module_vae_decoder = parse_bool(args.module_vae_decoder)
+    module_gene_ot = parse_bool(args.module_gene_ot)
+    if module_shared_private and module_vae_decoder:
+        raise ValueError("--module-shared-private and --module-vae-decoder are mutually exclusive.")
+    if module_vae_decoder and module_gene_ot:
+        raise ValueError("--module-gene-ot is not supported with --module-vae-decoder.")
 
     os.makedirs(args.parent_dir, exist_ok=True)
     visium_metrics: List[Dict] = []
