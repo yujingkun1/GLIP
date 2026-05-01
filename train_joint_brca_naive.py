@@ -110,6 +110,11 @@ class RunConfig:
     private_gate: float
     shared_align_weight: float
     orth_weight: float
+    module_vae_decoder: bool
+    vae_latent_dim: int
+    vae_hidden_dim: int
+    vae_recon_weight: float
+    vae_kl_weight: float
     module_ot: bool
     module_image_ot: bool
     module_gene_ot: bool
@@ -202,6 +207,12 @@ class PlatformConditionedModel(torch.nn.Module):
         private_gate: float = 0.25,
         shared_align_weight: float = 0.05,
         orth_weight: float = 0.01,
+        use_vae_decoder: bool = False,
+        vae_latent_dim: int = 128,
+        vae_hidden_dim: int = 512,
+        vae_recon_weight: float = 1.0,
+        vae_kl_weight: float = 1e-4,
+        output_gene_dim: int | None = None,
         use_image_ot: bool = False,
         use_gene_ot: bool = False,
         ot_transport: str = "ot",
@@ -215,6 +226,9 @@ class PlatformConditionedModel(torch.nn.Module):
         self.base_model = base_model
         self.use_platform_token = bool(use_platform_token)
         self.use_shared_private = bool(use_shared_private)
+        self.use_vae_decoder = bool(use_vae_decoder)
+        if self.use_shared_private and self.use_vae_decoder:
+            raise ValueError("--module-shared-private and --module-vae-decoder are mutually exclusive.")
         self.use_image_ot = bool(use_image_ot)
         self.use_gene_ot = bool(use_gene_ot)
         self.ot_transport = str(ot_transport).strip().lower()
@@ -224,6 +238,8 @@ class PlatformConditionedModel(torch.nn.Module):
         self.ot_gene_weight = float(ot_gene_weight)
         self.shared_align_weight = float(shared_align_weight)
         self.orth_weight = float(orth_weight)
+        self.vae_recon_weight = float(vae_recon_weight)
+        self.vae_kl_weight = float(vae_kl_weight)
         self.ot_sinkhorn_eps = float(ot_sinkhorn_eps)
         self.ot_sinkhorn_iters = int(ot_sinkhorn_iters)
         self.uot_marginal_weight = float(uot_marginal_weight)
@@ -233,7 +249,29 @@ class PlatformConditionedModel(torch.nn.Module):
         self.shared_private_dim = int(shared_private_dim)
         self.private_dim = int(private_dim)
         self.private_gate = float(private_gate)
+        self.vae_latent_dim = int(vae_latent_dim)
+        self.vae_hidden_dim = int(vae_hidden_dim)
+        self.output_gene_dim = int(output_gene_dim) if output_gene_dim is not None else None
         self.platform_token = torch.nn.Embedding(num_platforms, projection_dim) if self.use_platform_token else None
+        if self.use_vae_decoder:
+            if self.vae_latent_dim <= 0:
+                raise ValueError("vae_latent_dim must be positive when VAE decoder is enabled.")
+            if self.vae_hidden_dim <= 0:
+                raise ValueError("vae_hidden_dim must be positive when VAE decoder is enabled.")
+            if self.output_gene_dim is None or self.output_gene_dim <= 0:
+                raise ValueError("output_gene_dim must be positive when VAE decoder is enabled.")
+            self.vae_mu = torch.nn.Linear(projection_dim, self.vae_latent_dim)
+            self.vae_logvar = torch.nn.Linear(projection_dim, self.vae_latent_dim)
+            self.vae_decoder = torch.nn.Sequential(
+                torch.nn.Linear(self.vae_latent_dim, self.vae_hidden_dim),
+                torch.nn.GELU(),
+                torch.nn.LayerNorm(self.vae_hidden_dim),
+                torch.nn.Linear(self.vae_hidden_dim, self.output_gene_dim),
+            )
+        else:
+            self.vae_mu = None
+            self.vae_logvar = None
+            self.vae_decoder = None
         if self.use_shared_private:
             if self.shared_private_dim <= 0:
                 raise ValueError("shared_private_dim must be positive when shared/private is enabled.")
@@ -256,6 +294,11 @@ class PlatformConditionedModel(torch.nn.Module):
             self.gene_private_adapter = None
             self.image_fused_norm = None
             self.gene_fused_norm = None
+
+    def encode_image_base(self, images: torch.Tensor, platform_ids: torch.Tensor | None = None) -> torch.Tensor:
+        image_features = self.base_model.image_encoder(images)
+        image_embeddings = self.base_model.image_projection(image_features)
+        return self._apply_platform_token(image_embeddings, platform_ids)
 
     @staticmethod
     def _make_latent_head(input_dim: int, output_dim: int) -> torch.nn.Module:
@@ -288,8 +331,7 @@ class PlatformConditionedModel(torch.nn.Module):
         platform_ids: torch.Tensor | None = None,
         embedding_view: str = "fused",
     ) -> torch.Tensor:
-        image_features = self.base_model.image_encoder(images)
-        image_embeddings = self.base_model.image_projection(image_features)
+        image_embeddings = self.encode_image_base(images, platform_ids=None)
         if self.use_shared_private:
             return self._select_embedding_view(
                 self._split_embeddings(image_embeddings, platform_ids, modality="image"),
@@ -351,6 +393,34 @@ class PlatformConditionedModel(torch.nn.Module):
         if view not in views:
             raise ValueError(f"Unsupported embedding_view={embedding_view!r}; expected one of {sorted(views)}")
         return views[view]
+
+    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        if not self.training:
+            return mu
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def predict_expression_from_images(
+        self,
+        images: torch.Tensor,
+        platform_ids: torch.Tensor | None = None,
+        return_latent: bool = False,
+    ):
+        if not self.use_vae_decoder or self.vae_mu is None or self.vae_logvar is None or self.vae_decoder is None:
+            raise RuntimeError("VAE decoder is not enabled.")
+        image_embeddings = self.encode_image_base(images, platform_ids=platform_ids)
+        mu = self.vae_mu(image_embeddings)
+        logvar = self.vae_logvar(image_embeddings).clamp(min=-12.0, max=12.0)
+        z = self.reparameterize(mu, logvar)
+        prediction = self.vae_decoder(z)
+        if return_latent:
+            return prediction, mu, logvar, z, image_embeddings
+        return prediction
+
+    def compute_vae_kl_loss(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        kl_per_sample = -0.5 * torch.sum(1.0 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+        return kl_per_sample.mean()
 
     def compute_contrastive_loss(
         self,
@@ -532,6 +602,50 @@ class PlatformConditionedModel(torch.nn.Module):
         spot_base_embeddings = self.base_model.spot_projection(batch["reduced_expression"])
 
         zero = image_base_embeddings.new_zeros(())
+        vae_recon_loss = zero
+        vae_kl_loss = zero
+        if self.use_vae_decoder:
+            if self.vae_mu is None or self.vae_logvar is None or self.vae_decoder is None:
+                raise RuntimeError("VAE decoder is not initialized.")
+            image_embeddings = self._apply_platform_token(image_base_embeddings, platform_ids)
+            mu = self.vae_mu(image_embeddings)
+            logvar = self.vae_logvar(image_embeddings).clamp(min=-12.0, max=12.0)
+            z = self.reparameterize(mu, logvar)
+            predictions = self.vae_decoder(z)
+            vae_recon_loss = F.mse_loss(predictions, batch["reduced_expression"])
+            vae_kl_loss = self.compute_vae_kl_loss(mu, logvar)
+            image_ot_loss, image_ot_pairs = self.compute_image_ot_loss(image_embeddings, platform_ids)
+            gene_ot_loss = zero
+            gene_ot_pairs = 0
+            shared_image_align_loss = zero
+            shared_gene_align_loss = zero
+            shared_image_align_pairs = 0
+            shared_gene_align_pairs = 0
+            orth_loss = zero
+            main_loss = vae_recon_loss
+            total_loss = (
+                self.vae_recon_weight * vae_recon_loss
+                + self.vae_kl_weight * vae_kl_loss
+                + self.ot_image_weight * image_ot_loss
+            )
+            if not return_components:
+                return total_loss
+            return {
+                "total_loss": total_loss,
+                "main_loss": main_loss,
+                "image_ot_loss": image_ot_loss,
+                "gene_ot_loss": gene_ot_loss,
+                "shared_image_align_loss": shared_image_align_loss,
+                "shared_gene_align_loss": shared_gene_align_loss,
+                "orth_loss": orth_loss,
+                "vae_recon_loss": vae_recon_loss,
+                "vae_kl_loss": vae_kl_loss,
+                "image_ot_pairs": int(image_ot_pairs),
+                "gene_ot_pairs": int(gene_ot_pairs),
+                "shared_image_align_pairs": int(shared_image_align_pairs),
+                "shared_gene_align_pairs": int(shared_gene_align_pairs),
+            }
+
         if self.use_shared_private:
             image_views = self._split_embeddings(image_base_embeddings, platform_ids, modality="image")
             gene_views = self._split_embeddings(spot_base_embeddings, platform_ids, modality="gene")
@@ -583,6 +697,8 @@ class PlatformConditionedModel(torch.nn.Module):
             "shared_image_align_loss": shared_image_align_loss,
             "shared_gene_align_loss": shared_gene_align_loss,
             "orth_loss": orth_loss,
+            "vae_recon_loss": vae_recon_loss,
+            "vae_kl_loss": vae_kl_loss,
             "image_ot_pairs": int(image_ot_pairs),
             "gene_ot_pairs": int(gene_ot_pairs),
             "shared_image_align_pairs": int(shared_image_align_pairs),
@@ -598,6 +714,8 @@ def train_epoch(model, train_loader: DataLoader, optimizer, device: torch.device
     shared_image_align_loss_meter = AvgMeter("shared_image_align_loss")
     shared_gene_align_loss_meter = AvgMeter("shared_gene_align_loss")
     orth_loss_meter = AvgMeter("orth_loss")
+    vae_recon_loss_meter = AvgMeter("vae_recon_loss")
+    vae_kl_loss_meter = AvgMeter("vae_kl_loss")
     image_ot_active_batch_meter = AvgMeter("image_ot_active_batches")
     gene_ot_active_batch_meter = AvgMeter("gene_ot_active_batches")
     shared_image_align_active_batch_meter = AvgMeter("shared_image_align_active_batches")
@@ -623,6 +741,8 @@ def train_epoch(model, train_loader: DataLoader, optimizer, device: torch.device
         shared_image_align_loss_meter.update(float(loss_components["shared_image_align_loss"].item()), count)
         shared_gene_align_loss_meter.update(float(loss_components["shared_gene_align_loss"].item()), count)
         orth_loss_meter.update(float(loss_components["orth_loss"].item()), count)
+        vae_recon_loss_meter.update(float(loss_components["vae_recon_loss"].item()), count)
+        vae_kl_loss_meter.update(float(loss_components["vae_kl_loss"].item()), count)
         image_ot_active_batch_meter.update(1.0 if int(loss_components["image_ot_pairs"]) > 0 else 0.0, 1)
         gene_ot_active_batch_meter.update(1.0 if int(loss_components["gene_ot_pairs"]) > 0 else 0.0, 1)
         shared_image_align_active_batch_meter.update(1.0 if int(loss_components["shared_image_align_pairs"]) > 0 else 0.0, 1)
@@ -638,6 +758,7 @@ def train_epoch(model, train_loader: DataLoader, optimizer, device: torch.device
             gene_ot=gene_ot_loss_meter.avg,
             sp_align=shared_gene_align_loss_meter.avg,
             orth=orth_loss_meter.avg,
+            vae=vae_recon_loss_meter.avg,
             lr=get_lr(optimizer),
         )
     return {
@@ -648,6 +769,8 @@ def train_epoch(model, train_loader: DataLoader, optimizer, device: torch.device
         "shared_image_align_loss": float(shared_image_align_loss_meter.avg),
         "shared_gene_align_loss": float(shared_gene_align_loss_meter.avg),
         "orth_loss": float(orth_loss_meter.avg),
+        "vae_recon_loss": float(vae_recon_loss_meter.avg),
+        "vae_kl_loss": float(vae_kl_loss_meter.avg),
         "image_ot_active_fraction": float(image_ot_active_batch_meter.avg),
         "gene_ot_active_fraction": float(gene_ot_active_batch_meter.avg),
         "shared_image_align_active_fraction": float(shared_image_align_active_batch_meter.avg),
@@ -760,6 +883,31 @@ def predict_expression_from_retrieval(train_spot_bank, test_image_queries, top_k
     return torch.cat(predictions, dim=0).numpy()
 
 
+@torch.no_grad()
+def predict_expression_from_vae_decoder(model, loader: DataLoader, device: torch.device) -> Dict[str, np.ndarray]:
+    predictions = []
+    targets = []
+    sample_ids = []
+    barcodes = []
+    model.eval()
+    for batch in loader:
+        images = batch["image"].to(device, non_blocking=True)
+        platform_ids = batch.get("platform_id")
+        if platform_ids is not None:
+            platform_ids = platform_ids.to(device, non_blocking=True)
+        predicted = model.predict_expression_from_images(images, platform_ids=platform_ids)
+        predictions.append(predicted.detach().cpu())
+        targets.append(batch["reduced_expression"].detach().cpu())
+        sample_ids.extend(list(batch["sample_id"]))
+        barcodes.extend(list(batch["barcode"]))
+    return {
+        "predictions": torch.cat(predictions, dim=0).numpy(),
+        "targets": torch.cat(targets, dim=0).numpy(),
+        "sample_ids": sample_ids,
+        "barcodes": barcodes,
+    }
+
+
 def compute_metrics(predictions, targets):
     predictions = np.asarray(predictions, dtype=np.float32)
     targets = np.asarray(targets, dtype=np.float32)
@@ -792,6 +940,11 @@ def build_model(
     private_gate: float = 0.25,
     shared_align_weight: float = 0.05,
     orth_weight: float = 0.01,
+    use_vae_decoder: bool = False,
+    vae_latent_dim: int = 128,
+    vae_hidden_dim: int = 512,
+    vae_recon_weight: float = 1.0,
+    vae_kl_weight: float = 1e-4,
     use_image_ot: bool = False,
     use_gene_ot: bool = False,
     ot_transport: str = "ot",
@@ -825,6 +978,12 @@ def build_model(
         private_gate=private_gate,
         shared_align_weight=shared_align_weight,
         orth_weight=orth_weight,
+        use_vae_decoder=use_vae_decoder,
+        vae_latent_dim=vae_latent_dim,
+        vae_hidden_dim=vae_hidden_dim,
+        vae_recon_weight=vae_recon_weight,
+        vae_kl_weight=vae_kl_weight,
+        output_gene_dim=spot_embedding_dim,
         use_image_ot=use_image_ot,
         use_gene_ot=use_gene_ot,
         ot_transport=ot_transport,
@@ -971,6 +1130,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--private-gate', type=float, default=0.25)
     parser.add_argument('--shared-align-weight', type=float, default=0.05)
     parser.add_argument('--orth-weight', type=float, default=0.01)
+    parser.add_argument('--module-vae-decoder', default='false')
+    parser.add_argument('--vae-latent-dim', type=int, default=128)
+    parser.add_argument('--vae-hidden-dim', type=int, default=512)
+    parser.add_argument('--vae-recon-weight', type=float, default=1.0)
+    parser.add_argument('--vae-kl-weight', type=float, default=1e-4)
     parser.add_argument('--module-ot', default='false')
     parser.add_argument('--module-image-ot', default='')
     parser.add_argument('--module-gene-ot', default='false')
@@ -995,6 +1159,7 @@ def main() -> None:
     args.module_naive_joint = parse_bool(args.module_naive_joint)
     args.module_platform_token = parse_bool(args.module_platform_token)
     args.module_shared_private = parse_bool(args.module_shared_private)
+    args.module_vae_decoder = parse_bool(args.module_vae_decoder)
     args.module_ot = parse_bool(args.module_ot)
     args.module_image_ot = parse_bool(args.module_image_ot) if str(args.module_image_ot).strip() else args.module_ot
     args.module_gene_ot = parse_bool(args.module_gene_ot)
@@ -1004,6 +1169,10 @@ def main() -> None:
 
     if not args.module_naive_joint:
         raise ValueError("This script is the Stage2 naive joint implementation; --module-naive-joint must remain true.")
+    if args.module_shared_private and args.module_vae_decoder:
+        raise ValueError("--module-shared-private and --module-vae-decoder are mutually exclusive.")
+    if args.module_vae_decoder and args.module_gene_ot:
+        raise ValueError("--module-gene-ot is not supported with --module-vae-decoder because the decoder path has no trained gene retrieval embedding.")
     unsupported_modules = {
         'platform_token': args.module_platform_token,
         'gene_completion': args.module_gene_completion,
@@ -1053,6 +1222,11 @@ def main() -> None:
         private_gate=args.private_gate,
         shared_align_weight=args.shared_align_weight,
         orth_weight=args.orth_weight,
+        use_vae_decoder=args.module_vae_decoder,
+        vae_latent_dim=args.vae_latent_dim,
+        vae_hidden_dim=args.vae_hidden_dim,
+        vae_recon_weight=args.vae_recon_weight,
+        vae_kl_weight=args.vae_kl_weight,
         use_image_ot=args.module_image_ot,
         use_gene_ot=args.module_gene_ot,
         ot_transport=args.ot_transport,
@@ -1103,6 +1277,11 @@ def main() -> None:
         private_gate=args.private_gate,
         shared_align_weight=args.shared_align_weight,
         orth_weight=args.orth_weight,
+        module_vae_decoder=args.module_vae_decoder,
+        vae_latent_dim=args.vae_latent_dim,
+        vae_hidden_dim=args.vae_hidden_dim,
+        vae_recon_weight=args.vae_recon_weight,
+        vae_kl_weight=args.vae_kl_weight,
         module_ot=args.module_ot,
         module_image_ot=args.module_image_ot,
         module_gene_ot=args.module_gene_ot,
@@ -1141,6 +1320,11 @@ def main() -> None:
             'private_gate': args.private_gate,
             'shared_align_weight': args.shared_align_weight,
             'orth_weight': args.orth_weight,
+            'vae_decoder': args.module_vae_decoder,
+            'vae_latent_dim': args.vae_latent_dim,
+            'vae_hidden_dim': args.vae_hidden_dim,
+            'vae_recon_weight': args.vae_recon_weight,
+            'vae_kl_weight': args.vae_kl_weight,
             'ot': args.module_ot,
             'image_ot': args.module_image_ot,
             'gene_ot': args.module_gene_ot,
@@ -1173,6 +1357,8 @@ def main() -> None:
             'joint_train_shared_image_align_loss': float(train_stats['shared_image_align_loss']),
             'joint_train_shared_gene_align_loss': float(train_stats['shared_gene_align_loss']),
             'joint_train_orth_loss': float(train_stats['orth_loss']),
+            'joint_train_vae_recon_loss': float(train_stats['vae_recon_loss']),
+            'joint_train_vae_kl_loss': float(train_stats['vae_kl_loss']),
             'joint_train_image_ot_active_fraction': float(train_stats['image_ot_active_fraction']),
             'joint_train_gene_ot_active_fraction': float(train_stats['gene_ot_active_fraction']),
             'joint_train_shared_image_align_active_fraction': float(train_stats['shared_image_align_active_fraction']),
@@ -1196,30 +1382,45 @@ def main() -> None:
     best_payload = torch.load(os.path.join(args.run_dir, 'best.pt'), map_location=device)
     model.load_state_dict(best_payload['model_state_dict'])
 
-    visium_bank = collect_spot_bank(model, vis_train_eval_loader, device)
-    xenium_bank = collect_spot_bank(model, xen_train_eval_loader, device)
-    joint_bank = collect_spot_bank(model, train_eval_loader, device)
-    vis_queries = collect_image_queries(model, vis_test_loader, device)
-    xen_queries = collect_image_queries(model, xen_test_loader, device)
-
-    if args.eval_bank_mode == 'target':
-        visium_primary_bank = visium_bank
-        xenium_primary_bank = xenium_bank
-    elif args.eval_bank_mode == 'joint':
-        visium_primary_bank = joint_bank
-        xenium_primary_bank = joint_bank
+    if args.module_vae_decoder:
+        visium_bank = {"embeddings": torch.empty((0, 0))}
+        xenium_bank = {"embeddings": torch.empty((0, 0))}
+        joint_bank = {"embeddings": torch.empty((0, 0))}
+        vis_queries = predict_expression_from_vae_decoder(model, vis_test_loader, device)
+        xen_queries = predict_expression_from_vae_decoder(model, xen_test_loader, device)
+        vis_query_count = int(vis_queries["predictions"].shape[0])
+        xen_query_count = int(xen_queries["predictions"].shape[0])
+        vis_metrics = compute_metrics(vis_queries["predictions"], vis_queries["targets"])
+        xen_metrics = compute_metrics(xen_queries["predictions"], xen_queries["targets"])
+        vis_joint_bank_metrics = dict(vis_metrics)
+        xen_joint_bank_metrics = dict(xen_metrics)
     else:
-        raise ValueError(f"Unsupported eval bank mode: {args.eval_bank_mode}")
+        visium_bank = collect_spot_bank(model, vis_train_eval_loader, device)
+        xenium_bank = collect_spot_bank(model, xen_train_eval_loader, device)
+        joint_bank = collect_spot_bank(model, train_eval_loader, device)
+        vis_queries = collect_image_queries(model, vis_test_loader, device)
+        xen_queries = collect_image_queries(model, xen_test_loader, device)
+        vis_query_count = int(vis_queries['embeddings'].shape[0])
+        xen_query_count = int(xen_queries['embeddings'].shape[0])
 
-    vis_predictions = predict_expression_from_retrieval(visium_primary_bank, vis_queries, top_k=args.top_k, chunk_size=args.retrieval_chunk_size)
-    xen_predictions = predict_expression_from_retrieval(xenium_primary_bank, xen_queries, top_k=args.top_k, chunk_size=args.retrieval_chunk_size)
-    vis_predictions_joint_bank = predict_expression_from_retrieval(joint_bank, vis_queries, top_k=args.top_k, chunk_size=args.retrieval_chunk_size)
-    xen_predictions_joint_bank = predict_expression_from_retrieval(joint_bank, xen_queries, top_k=args.top_k, chunk_size=args.retrieval_chunk_size)
+        if args.eval_bank_mode == 'target':
+            visium_primary_bank = visium_bank
+            xenium_primary_bank = xenium_bank
+        elif args.eval_bank_mode == 'joint':
+            visium_primary_bank = joint_bank
+            xenium_primary_bank = joint_bank
+        else:
+            raise ValueError(f"Unsupported eval bank mode: {args.eval_bank_mode}")
 
-    vis_metrics = compute_metrics(vis_predictions, vis_queries['expressions'].numpy())
-    xen_metrics = compute_metrics(xen_predictions, xen_queries['expressions'].numpy())
-    vis_joint_bank_metrics = compute_metrics(vis_predictions_joint_bank, vis_queries['expressions'].numpy())
-    xen_joint_bank_metrics = compute_metrics(xen_predictions_joint_bank, xen_queries['expressions'].numpy())
+        vis_predictions = predict_expression_from_retrieval(visium_primary_bank, vis_queries, top_k=args.top_k, chunk_size=args.retrieval_chunk_size)
+        xen_predictions = predict_expression_from_retrieval(xenium_primary_bank, xen_queries, top_k=args.top_k, chunk_size=args.retrieval_chunk_size)
+        vis_predictions_joint_bank = predict_expression_from_retrieval(joint_bank, vis_queries, top_k=args.top_k, chunk_size=args.retrieval_chunk_size)
+        xen_predictions_joint_bank = predict_expression_from_retrieval(joint_bank, xen_queries, top_k=args.top_k, chunk_size=args.retrieval_chunk_size)
+
+        vis_metrics = compute_metrics(vis_predictions, vis_queries['expressions'].numpy())
+        xen_metrics = compute_metrics(xen_predictions, xen_queries['expressions'].numpy())
+        vis_joint_bank_metrics = compute_metrics(vis_predictions_joint_bank, vis_queries['expressions'].numpy())
+        xen_joint_bank_metrics = compute_metrics(xen_predictions_joint_bank, xen_queries['expressions'].numpy())
     vis_metrics['top_k'] = int(args.top_k)
     xen_metrics['top_k'] = int(args.top_k)
     vis_metrics['heldout_sample'] = visium_holdout_label
@@ -1240,12 +1441,13 @@ def main() -> None:
         'xenium_bank_size': int(xenium_bank['embeddings'].shape[0]),
         'joint_bank_size': int(joint_bank['embeddings'].shape[0]),
         'eval_bank_mode': args.eval_bank_mode,
+        'prediction_mode': 'vae_decoder' if args.module_vae_decoder else 'retrieval',
         'visium_test_metrics': vis_metrics,
         'xenium_test_metrics': xen_metrics,
         'visium_test_metrics_joint_bank': vis_joint_bank_metrics,
         'xenium_test_metrics_joint_bank': xen_joint_bank_metrics,
-        'visium_test_queries': int(vis_queries['embeddings'].shape[0]),
-        'xenium_test_queries': int(xen_queries['embeddings'].shape[0]),
+        'visium_test_queries': vis_query_count,
+        'xenium_test_queries': xen_query_count,
         'manual_baseline_override': True,
         'no_extra_datasets_used': True,
     }

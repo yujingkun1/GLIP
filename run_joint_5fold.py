@@ -57,6 +57,11 @@ def main() -> None:
     parser.add_argument("--private-gate", type=float, default=0.25)
     parser.add_argument("--shared-align-weight", type=float, default=0.05)
     parser.add_argument("--orth-weight", type=float, default=0.01)
+    parser.add_argument("--module-vae-decoder", default="false")
+    parser.add_argument("--vae-latent-dim", type=int, default=128)
+    parser.add_argument("--vae-hidden-dim", type=int, default=512)
+    parser.add_argument("--vae-recon-weight", type=float, default=1.0)
+    parser.add_argument("--vae-kl-weight", type=float, default=1e-4)
     parser.add_argument("--module-image-ot", default="false")
     parser.add_argument("--module-gene-ot", default="false")
     parser.add_argument("--ot-transport", choices=["ot", "uot"], default="ot")
@@ -131,6 +136,16 @@ def main() -> None:
             str(args.shared_align_weight),
             "--orth-weight",
             str(args.orth_weight),
+            "--module-vae-decoder",
+            str(args.module_vae_decoder),
+            "--vae-latent-dim",
+            str(args.vae_latent_dim),
+            "--vae-hidden-dim",
+            str(args.vae_hidden_dim),
+            "--vae-recon-weight",
+            str(args.vae_recon_weight),
+            "--vae-kl-weight",
+            str(args.vae_kl_weight),
             "--module-image-ot",
             str(args.module_image_ot),
             "--module-gene-ot",
