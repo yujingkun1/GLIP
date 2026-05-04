@@ -12,6 +12,7 @@ import argparse
 import csv
 import json
 import os
+import copy
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Sequence
@@ -105,6 +106,8 @@ class RunConfig:
     module_naive_joint: bool
     module_platform_token: bool
     module_shared_private: bool
+    keep_contrastive_loss: bool
+    module_platform_image_encoder: bool
     shared_private_dim: int
     private_dim: int
     private_gate: float
@@ -208,6 +211,8 @@ class PlatformConditionedModel(torch.nn.Module):
         shared_align_weight: float = 0.05,
         orth_weight: float = 0.01,
         use_vae_decoder: bool = False,
+        keep_contrastive_loss: bool = False,
+        use_platform_image_encoder: bool = False,
         vae_latent_dim: int = 128,
         vae_hidden_dim: int = 512,
         vae_recon_weight: float = 1.0,
@@ -227,6 +232,8 @@ class PlatformConditionedModel(torch.nn.Module):
         self.use_platform_token = bool(use_platform_token)
         self.use_shared_private = bool(use_shared_private)
         self.use_vae_decoder = bool(use_vae_decoder)
+        self.keep_contrastive_loss = bool(keep_contrastive_loss)
+        self.use_platform_image_encoder = bool(use_platform_image_encoder)
         if self.use_shared_private and self.use_vae_decoder:
             raise ValueError("--module-shared-private and --module-vae-decoder are mutually exclusive.")
         self.use_image_ot = bool(use_image_ot)
@@ -253,6 +260,7 @@ class PlatformConditionedModel(torch.nn.Module):
         self.vae_hidden_dim = int(vae_hidden_dim)
         self.output_gene_dim = int(output_gene_dim) if output_gene_dim is not None else None
         self.platform_token = torch.nn.Embedding(num_platforms, projection_dim) if self.use_platform_token else None
+        self.xenium_image_encoder = copy.deepcopy(base_model.image_encoder) if self.use_platform_image_encoder else None
         if self.use_vae_decoder:
             if self.vae_latent_dim <= 0:
                 raise ValueError("vae_latent_dim must be positive when VAE decoder is enabled.")
@@ -296,9 +304,32 @@ class PlatformConditionedModel(torch.nn.Module):
             self.gene_fused_norm = None
 
     def encode_image_base(self, images: torch.Tensor, platform_ids: torch.Tensor | None = None) -> torch.Tensor:
-        image_features = self.base_model.image_encoder(images)
+        image_features = self.encode_image_features(images, platform_ids)
         image_embeddings = self.base_model.image_projection(image_features)
         return self._apply_platform_token(image_embeddings, platform_ids)
+
+    def encode_image_features(self, images: torch.Tensor, platform_ids: torch.Tensor | None = None) -> torch.Tensor:
+        if self.xenium_image_encoder is None or platform_ids is None:
+            return self.base_model.image_encoder(images)
+        if images.size(0) != platform_ids.size(0):
+            raise ValueError("images and platform_ids batch sizes do not match.")
+        output = None
+        vis_mask = platform_ids == 0
+        xen_mask = platform_ids == 1
+        other_mask = ~(vis_mask | xen_mask)
+        for mask, encoder in (
+            (vis_mask | other_mask, self.base_model.image_encoder),
+            (xen_mask, self.xenium_image_encoder),
+        ):
+            if not bool(mask.any()):
+                continue
+            features = encoder(images[mask])
+            if output is None:
+                output = features.new_empty((images.size(0), features.size(1)))
+            output[mask] = features
+        if output is None:
+            raise RuntimeError("Unable to encode empty image batch.")
+        return output
 
     @staticmethod
     def _make_latent_head(input_dim: int, output_dim: int) -> torch.nn.Module:
@@ -331,7 +362,7 @@ class PlatformConditionedModel(torch.nn.Module):
         platform_ids: torch.Tensor | None = None,
         embedding_view: str = "fused",
     ) -> torch.Tensor:
-        image_embeddings = self.encode_image_base(images, platform_ids=None)
+        image_embeddings = self.encode_image_base(images, platform_ids=platform_ids if self.use_platform_image_encoder else None)
         if self.use_shared_private:
             return self._select_embedding_view(
                 self._split_embeddings(image_embeddings, platform_ids, modality="image"),
@@ -597,14 +628,14 @@ class PlatformConditionedModel(torch.nn.Module):
 
     def forward(self, batch: Dict[str, torch.Tensor], return_components: bool = False):
         platform_ids = batch.get("platform_id")
-        image_features = self.base_model.image_encoder(batch["image"])
+        image_features = self.encode_image_features(batch["image"], platform_ids=platform_ids)
         image_base_embeddings = self.base_model.image_projection(image_features)
         spot_base_embeddings = self.base_model.spot_projection(batch["reduced_expression"])
 
         zero = image_base_embeddings.new_zeros(())
         vae_recon_loss = zero
         vae_kl_loss = zero
-        if self.use_vae_decoder:
+        if self.use_vae_decoder and not self.keep_contrastive_loss:
             if self.vae_mu is None or self.vae_logvar is None or self.vae_decoder is None:
                 raise RuntimeError("VAE decoder is not initialized.")
             image_embeddings = self._apply_platform_token(image_base_embeddings, platform_ids)
@@ -658,6 +689,15 @@ class PlatformConditionedModel(torch.nn.Module):
             spot_embeddings = self._apply_platform_token(spot_base_embeddings, platform_ids)
 
         main_loss = self.compute_contrastive_loss(image_embeddings, spot_embeddings)
+        if self.use_vae_decoder:
+            if self.vae_mu is None or self.vae_logvar is None or self.vae_decoder is None:
+                raise RuntimeError("VAE decoder is not initialized.")
+            mu = self.vae_mu(image_embeddings)
+            logvar = self.vae_logvar(image_embeddings).clamp(min=-12.0, max=12.0)
+            z = self.reparameterize(mu, logvar)
+            predictions = self.vae_decoder(z)
+            vae_recon_loss = F.mse_loss(predictions, batch["reduced_expression"])
+            vae_kl_loss = self.compute_vae_kl_loss(mu, logvar)
         image_ot_loss, image_ot_pairs = self.compute_image_ot_loss(image_embeddings, platform_ids)
         gene_ot_loss, gene_ot_pairs = self.compute_gene_ot_loss(spot_embeddings, platform_ids)
         shared_image_align_loss = zero
@@ -682,6 +722,8 @@ class PlatformConditionedModel(torch.nn.Module):
 
         total_loss = (
             main_loss
+            + self.vae_recon_weight * vae_recon_loss
+            + self.vae_kl_weight * vae_kl_loss
             + self.ot_image_weight * image_ot_loss
             + self.ot_gene_weight * gene_ot_loss
             + self.shared_align_weight * (shared_image_align_loss + shared_gene_align_loss)
@@ -935,6 +977,8 @@ def build_model(
     checkpoint_path: str,
     use_platform_token: bool = False,
     use_shared_private: bool = False,
+    keep_contrastive_loss: bool = False,
+    use_platform_image_encoder: bool = False,
     shared_private_dim: int = 256,
     private_dim: int = 64,
     private_gate: float = 0.25,
@@ -973,6 +1017,8 @@ def build_model(
         base_model,
         use_platform_token=use_platform_token,
         use_shared_private=use_shared_private,
+        keep_contrastive_loss=keep_contrastive_loss,
+        use_platform_image_encoder=use_platform_image_encoder,
         shared_private_dim=shared_private_dim,
         private_dim=private_dim,
         private_gate=private_gate,
@@ -1125,6 +1171,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--module-naive-joint', default='true')
     parser.add_argument('--module-platform-token', default='false')
     parser.add_argument('--module-shared-private', default='false')
+    parser.add_argument('--keep-contrastive-loss', default='false')
+    parser.add_argument('--module-platform-image-encoder', default='false')
     parser.add_argument('--shared-private-dim', type=int, default=256)
     parser.add_argument('--private-dim', type=int, default=64)
     parser.add_argument('--private-gate', type=float, default=0.25)
@@ -1159,6 +1207,8 @@ def main() -> None:
     args.module_naive_joint = parse_bool(args.module_naive_joint)
     args.module_platform_token = parse_bool(args.module_platform_token)
     args.module_shared_private = parse_bool(args.module_shared_private)
+    args.keep_contrastive_loss = parse_bool(args.keep_contrastive_loss)
+    args.module_platform_image_encoder = parse_bool(args.module_platform_image_encoder)
     args.module_vae_decoder = parse_bool(args.module_vae_decoder)
     args.module_ot = parse_bool(args.module_ot)
     args.module_image_ot = parse_bool(args.module_image_ot) if str(args.module_image_ot).strip() else args.module_ot
@@ -1171,8 +1221,10 @@ def main() -> None:
         raise ValueError("This script is the Stage2 naive joint implementation; --module-naive-joint must remain true.")
     if args.module_shared_private and args.module_vae_decoder:
         raise ValueError("--module-shared-private and --module-vae-decoder are mutually exclusive.")
-    if args.module_vae_decoder and args.module_gene_ot:
+    if args.module_vae_decoder and args.module_gene_ot and not args.keep_contrastive_loss:
         raise ValueError("--module-gene-ot is not supported with --module-vae-decoder because the decoder path has no trained gene retrieval embedding.")
+    if args.keep_contrastive_loss and not args.module_vae_decoder:
+        raise ValueError("--keep-contrastive-loss requires --module-vae-decoder true.")
     unsupported_modules = {
         'platform_token': args.module_platform_token,
         'gene_completion': args.module_gene_completion,
@@ -1217,6 +1269,8 @@ def main() -> None:
         args.image_encoder_checkpoint,
         use_platform_token=args.module_platform_token,
         use_shared_private=args.module_shared_private,
+        keep_contrastive_loss=args.keep_contrastive_loss,
+        use_platform_image_encoder=args.module_platform_image_encoder,
         shared_private_dim=args.shared_private_dim,
         private_dim=args.private_dim,
         private_gate=args.private_gate,
@@ -1272,6 +1326,8 @@ def main() -> None:
         module_naive_joint=args.module_naive_joint,
         module_platform_token=args.module_platform_token,
         module_shared_private=args.module_shared_private,
+        keep_contrastive_loss=args.keep_contrastive_loss,
+        module_platform_image_encoder=args.module_platform_image_encoder,
         shared_private_dim=args.shared_private_dim,
         private_dim=args.private_dim,
         private_gate=args.private_gate,
@@ -1315,6 +1371,8 @@ def main() -> None:
             'naive_joint': args.module_naive_joint,
             'platform_token': args.module_platform_token,
             'shared_private': args.module_shared_private,
+            'keep_contrastive_loss': args.keep_contrastive_loss,
+            'platform_image_encoder': args.module_platform_image_encoder,
             'shared_private_dim': args.shared_private_dim,
             'private_dim': args.private_dim,
             'private_gate': args.private_gate,
@@ -1382,7 +1440,9 @@ def main() -> None:
     best_payload = torch.load(os.path.join(args.run_dir, 'best.pt'), map_location=device)
     model.load_state_dict(best_payload['model_state_dict'])
 
-    if args.module_vae_decoder:
+    decoder_vis_metrics = None
+    decoder_xen_metrics = None
+    if args.module_vae_decoder and not args.keep_contrastive_loss:
         visium_bank = {"embeddings": torch.empty((0, 0))}
         xenium_bank = {"embeddings": torch.empty((0, 0))}
         joint_bank = {"embeddings": torch.empty((0, 0))}
@@ -1421,6 +1481,16 @@ def main() -> None:
         xen_metrics = compute_metrics(xen_predictions, xen_queries['expressions'].numpy())
         vis_joint_bank_metrics = compute_metrics(vis_predictions_joint_bank, vis_queries['expressions'].numpy())
         xen_joint_bank_metrics = compute_metrics(xen_predictions_joint_bank, xen_queries['expressions'].numpy())
+        if args.module_vae_decoder:
+            decoder_vis_queries = predict_expression_from_vae_decoder(model, vis_test_loader, device)
+            decoder_xen_queries = predict_expression_from_vae_decoder(model, xen_test_loader, device)
+            decoder_vis_metrics = compute_metrics(decoder_vis_queries["predictions"], decoder_vis_queries["targets"])
+            decoder_xen_metrics = compute_metrics(decoder_xen_queries["predictions"], decoder_xen_queries["targets"])
+            decoder_vis_metrics["top_k"] = 0
+            decoder_xen_metrics["top_k"] = 0
+            decoder_vis_metrics["heldout_sample"] = visium_holdout_label
+            decoder_vis_metrics["heldout_samples"] = visium_test_samples
+            decoder_xen_metrics["xenium_sample_id"] = args.xenium_sample_id
     vis_metrics['top_k'] = int(args.top_k)
     xen_metrics['top_k'] = int(args.top_k)
     vis_metrics['heldout_sample'] = visium_holdout_label
@@ -1441,11 +1511,13 @@ def main() -> None:
         'xenium_bank_size': int(xenium_bank['embeddings'].shape[0]),
         'joint_bank_size': int(joint_bank['embeddings'].shape[0]),
         'eval_bank_mode': args.eval_bank_mode,
-        'prediction_mode': 'vae_decoder' if args.module_vae_decoder else 'retrieval',
+        'prediction_mode': 'hybrid_retrieval_with_vae_decoder' if args.keep_contrastive_loss else ('vae_decoder' if args.module_vae_decoder else 'retrieval'),
         'visium_test_metrics': vis_metrics,
         'xenium_test_metrics': xen_metrics,
         'visium_test_metrics_joint_bank': vis_joint_bank_metrics,
         'xenium_test_metrics_joint_bank': xen_joint_bank_metrics,
+        'visium_test_metrics_decoder': decoder_vis_metrics,
+        'xenium_test_metrics_decoder': decoder_xen_metrics,
         'visium_test_queries': vis_query_count,
         'xenium_test_queries': xen_query_count,
         'manual_baseline_override': True,
@@ -1459,6 +1531,11 @@ def main() -> None:
         {'target': 'visium_joint_bank_diag', **vis_joint_bank_metrics},
         {'target': 'xenium_joint_bank_diag', **xen_joint_bank_metrics},
     ]
+    if decoder_vis_metrics is not None and decoder_xen_metrics is not None:
+        rows.extend([
+            {'target': 'visium_decoder_diag', **decoder_vis_metrics},
+            {'target': 'xenium_pseudospot_decoder_diag', **decoder_xen_metrics},
+        ])
     csv_path = os.path.join(args.run_dir, 'metrics_table.csv')
     with open(csv_path, 'w', newline='', encoding='utf-8') as handle:
         writer = csv.DictWriter(handle, fieldnames=sorted({k for row in rows for k in row.keys()}))

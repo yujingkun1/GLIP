@@ -61,6 +61,8 @@ def main() -> None:
     parser.add_argument("--eval-bank-mode", default="target", choices=["target", "joint"])
     parser.add_argument("--module-platform-token", default="false")
     parser.add_argument("--module-shared-private", default="false")
+    parser.add_argument("--keep-contrastive-loss", default="false")
+    parser.add_argument("--module-platform-image-encoder", default="false")
     parser.add_argument("--shared-private-dim", type=int, default=256)
     parser.add_argument("--private-dim", type=int, default=64)
     parser.add_argument("--private-gate", type=float, default=0.25)
@@ -82,10 +84,13 @@ def main() -> None:
     module_shared_private = parse_bool(args.module_shared_private)
     module_vae_decoder = parse_bool(args.module_vae_decoder)
     module_gene_ot = parse_bool(args.module_gene_ot)
+    keep_contrastive_loss = parse_bool(args.keep_contrastive_loss)
     if module_shared_private and module_vae_decoder:
         raise ValueError("--module-shared-private and --module-vae-decoder are mutually exclusive.")
-    if module_vae_decoder and module_gene_ot:
+    if module_vae_decoder and module_gene_ot and not keep_contrastive_loss:
         raise ValueError("--module-gene-ot is not supported with --module-vae-decoder.")
+    if keep_contrastive_loss and not module_vae_decoder:
+        raise ValueError("--keep-contrastive-loss requires --module-vae-decoder true.")
 
     os.makedirs(args.parent_dir, exist_ok=True)
     visium_metrics: List[Dict] = []
@@ -143,6 +148,10 @@ def main() -> None:
             str(args.module_platform_token),
             "--module-shared-private",
             str(args.module_shared_private),
+            "--keep-contrastive-loss",
+            str(args.keep_contrastive_loss),
+            "--module-platform-image-encoder",
+            str(args.module_platform_image_encoder),
             "--shared-private-dim",
             str(args.shared_private_dim),
             "--private-dim",
