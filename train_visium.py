@@ -28,10 +28,13 @@ DEFAULT_LOO_SAMPLE_IDS = [
 ]
 
 UNI_MODEL_NAME = "hf-hub:MahmoodLab/UNI2-h"
+H0MINI_MODEL_NAME = "hf-hub:bioptimus/H0-mini"
 
 MODEL_NAME_ALIASES = {
     "uni": UNI_MODEL_NAME,
     "uni2-h": UNI_MODEL_NAME,
+    "h0mini": H0MINI_MODEL_NAME,
+    "h0-mini": H0MINI_MODEL_NAME,
 }
 
 DEFAULT_VISIUM_GENE_FILE = "/data/yujk/GLIP/configs/brca_shared_genes_ncbi784_visium36_intersection_227.txt"
@@ -75,6 +78,9 @@ parser.add_argument(
     help="image encoder backbone or alias, e.g. resnet50, uni, vit, clip",
 )
 parser.add_argument("--device_id", type=int, default=1, help="CUDA device id to use for single-GPU training")
+parser.add_argument("--trainable", action="store_true", help="Unfreeze H0-mini parameters for fine-tuning")
+parser.add_argument("--lr", type=float, default=CFG.lr, help="learning rate")
+parser.add_argument("--weight_decay", type=float, default=CFG.weight_decay, help="weight decay")
 
 
 def parse_sample_ids(raw_sample_ids):
@@ -187,6 +193,7 @@ def build_base_dataset(args, sample_ids):
         gene_file=args.gene_file or None,
         max_spots_per_sample=args.max_spots_per_sample or None,
         is_train=False,
+        model_name=args.model,  # Pass model name for normalization
     )
 
     print(f"Total aligned spots across CV panel: {len(dataset)}")
@@ -295,6 +302,7 @@ def build_model(args, spot_embedding_dim):
     from glip.visium.models import (
         CLIPModel,
         CLIPModel_CLIP,
+        CLIPModel_H0mini,
         CLIPModel_UNI,
         CLIPModel_ViT,
         CLIPModel_ViT_L,
@@ -319,6 +327,15 @@ def build_model(args, spot_embedding_dim):
     if model_choice == "resnet152":
         print("Image encoder is ResNet152")
         return CLIPModel_resnet152(spot_embedding=spot_embedding_dim)
+    if model_choice == "h0mini" or model_choice == "h0-mini" or args.resolved_model_name == H0MINI_MODEL_NAME:
+        print(f"Image encoder is H0-mini ({H0MINI_MODEL_NAME})")
+        return CLIPModel_H0mini(
+            spot_embedding=spot_embedding_dim,
+            pretrained=args.pretrained,
+            checkpoint_path=args.image_encoder_checkpoint,
+            output_mode="pooled",
+            trainable=getattr(args, 'trainable', False),
+        )
     if model_choice == "uni" or args.resolved_model_name == UNI_MODEL_NAME:
         print(f"Image encoder is UNI2-h ({UNI_MODEL_NAME})")
         return CLIPModel_UNI(spot_embedding=spot_embedding_dim)
@@ -780,7 +797,7 @@ def main():
             else:
                 model = nn.parallel.DistributedDataParallel(model)
 
-        optimizer = torch.optim.AdamW(model.parameters(), lr=CFG.lr, weight_decay=CFG.weight_decay)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         best_loss = float("inf")
         best_epoch = 0
         train_loss_history = []

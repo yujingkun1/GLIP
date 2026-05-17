@@ -7,6 +7,7 @@ from .modules import (
     ImageEncoder,
     ImageEncoder_CLIP,
     ImageEncoder_UNI,
+    ImageEncoder_H0mini,
     ImageEncoder_ViT,
     ImageEncoder_ViT_L,
     ImageEncoder_resnet101,
@@ -87,6 +88,52 @@ class CLIPModel_UNI(nn.Module):
         )
         self.image_projection = ProjectionHead(
             embedding_dim=_resolve_image_embedding(self.image_encoder, image_embedding)
+        )
+        self.spot_projection = ProjectionHead(embedding_dim=spot_embedding)
+        self.temperature = temperature
+
+    def forward(self, batch):
+        image_features = self.image_encoder(batch["image"])
+        spot_features = batch["reduced_expression"]
+
+        image_embeddings = self.image_projection(image_features)
+        spot_embeddings = self.spot_projection(spot_features)
+
+        logits = (spot_embeddings @ image_embeddings.T) / self.temperature
+        images_similarity = image_embeddings @ image_embeddings.T
+        spots_similarity = spot_embeddings @ spot_embeddings.T
+        targets = F.softmax(
+            ((images_similarity + spots_similarity) / 2) / self.temperature, dim=-1
+        )
+        spots_loss = cross_entropy(logits, targets, reduction='none')
+        images_loss = cross_entropy(logits.T, targets.T, reduction='none')
+        loss = (images_loss + spots_loss) / 2.0
+        return loss.mean()
+
+
+class CLIPModel_H0mini(nn.Module):
+    """
+    CLIP model using H0-mini encoder.
+    Supports both pooled (CLS token) and patch_tokens modes.
+    """
+    def __init__(
+        self,
+        temperature=CFG.temperature,
+        spot_embedding=CFG.spot_embedding,
+        pretrained=True,
+        checkpoint_path=CFG.H0MINI_CHECKPOINT,
+        output_mode=CFG.H0MINI_OUTPUT_MODE,
+        trainable=False,
+    ):
+        super().__init__()
+        self.image_encoder = ImageEncoder_H0mini(
+            pretrained=pretrained,
+            checkpoint_path=checkpoint_path,
+            output_mode=output_mode,
+            trainable=trainable,
+        )
+        self.image_projection = ProjectionHead(
+            embedding_dim=CFG.H0MINI_OUTPUT_DIM
         )
         self.spot_projection = ProjectionHead(embedding_dim=spot_embedding)
         self.temperature = temperature

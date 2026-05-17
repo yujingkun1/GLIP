@@ -329,6 +329,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=CFG.TEMPERATURE, help="Contrastive temperature")
     parser.add_argument("--model", default=CFG.MODEL_NAME, help="Image encoder backbone, e.g. resnet50 or uni")
     parser.add_argument("--pretrained", default="true", help="Use pretrained image encoder weights when available")
+    parser.add_argument("--trainable", action="store_true", help="Unfreeze H0-mini parameters for fine-tuning")
     parser.add_argument(
         "--image-encoder-checkpoint",
         default=CFG.IMAGE_ENCODER_CHECKPOINT,
@@ -569,6 +570,7 @@ def main() -> None:
         scfoundation_key=args.scfoundation_key,
         scfoundation_pool_type=args.scfoundation_pool_type,
         scfoundation_tgthighres=args.scfoundation_tgthighres,
+        trainable=args.trainable,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 

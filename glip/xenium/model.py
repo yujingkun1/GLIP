@@ -17,10 +17,13 @@ from . import config as CFG
 
 
 UNI_MODEL_NAME = "hf-hub:MahmoodLab/UNI2-h"
+H0MINI_MODEL_NAME = "hf-hub:bioptimus/H0-mini"
 
 MODEL_NAME_ALIASES = {
     "uni": UNI_MODEL_NAME,
     "uni2-h": UNI_MODEL_NAME,
+    "h0mini": H0MINI_MODEL_NAME,
+    "h0-mini": H0MINI_MODEL_NAME,
 }
 
 UNI2_H_BACKBONE_NAME = "vit_giant_patch14_224"
@@ -130,10 +133,42 @@ def _build_uni2_h(pretrained: bool, checkpoint_path: str) -> Tuple[nn.Module, in
     return model, _infer_output_dim(model)
 
 
-def _build_timm_image_encoder(model_name: str, pretrained: bool, checkpoint_path: str) -> Tuple[nn.Module, int]:
+def _build_h0mini(pretrained: bool, checkpoint_path: str, trainable: bool = False) -> Tuple[nn.Module, int]:
+    """Build H0-mini encoder (ViT-B/14 reg4, 768-dim output)."""
+    timm = _import_timm()
+
+    if pretrained and not checkpoint_path:
+        # Load from HuggingFace
+        model = timm.create_model(H0MINI_MODEL_NAME, pretrained=True, num_classes=0)
+    else:
+        # Load from local checkpoint with correct architecture
+        model = timm.create_model(
+            "vit_base_patch14_reg4_dinov2",
+            pretrained=False,
+            num_classes=0,
+            img_size=224,
+            reg_tokens=4,
+            dynamic_img_size=True,
+            mlp_ratio=5.33334,
+            mlp_layer=timm.layers.SwiGLUPacked,
+            act_layer=torch.nn.SiLU,
+        )
+        if checkpoint_path:
+            _load_local_checkpoint(model, checkpoint_path)
+
+    # Set trainability
+    for param in model.parameters():
+        param.requires_grad = trainable
+
+    return model, 768  # H0-mini output dimension
+
+
+def _build_timm_image_encoder(model_name: str, pretrained: bool, checkpoint_path: str, trainable: bool = False) -> Tuple[nn.Module, int]:
     resolved_model_name = resolve_image_model_name(model_name)
     if resolved_model_name == UNI_MODEL_NAME:
         return _build_uni2_h(pretrained=pretrained, checkpoint_path=checkpoint_path)
+    if resolved_model_name == H0MINI_MODEL_NAME:
+        return _build_h0mini(pretrained=pretrained, checkpoint_path=checkpoint_path, trainable=trainable)
 
     timm = _import_timm()
     model = timm.create_model(
@@ -147,7 +182,7 @@ def _build_timm_image_encoder(model_name: str, pretrained: bool, checkpoint_path
     return model, _infer_output_dim(model)
 
 
-def _build_image_encoder(model_name: str, pretrained: bool, checkpoint_path: str) -> Tuple[nn.Module, int]:
+def _build_image_encoder(model_name: str, pretrained: bool, checkpoint_path: str, trainable: bool = False) -> Tuple[nn.Module, int]:
     resolved_model_name = resolve_image_model_name(model_name)
     if resolved_model_name == "resnet50":
         return _build_resnet50(pretrained=pretrained, checkpoint_path=checkpoint_path)
@@ -155,6 +190,7 @@ def _build_image_encoder(model_name: str, pretrained: bool, checkpoint_path: str
         model_name=resolved_model_name,
         pretrained=pretrained,
         checkpoint_path=checkpoint_path,
+        trainable=trainable,
     )
 
 
@@ -308,6 +344,7 @@ class ContrastiveImageGeneModel(nn.Module):
         scfoundation_key: str = CFG.SCFOUNDATION_KEY,
         scfoundation_pool_type: str = CFG.SCFOUNDATION_POOL_TYPE,
         scfoundation_tgthighres: str = CFG.SCFOUNDATION_TGTHIGHRES,
+        trainable: bool = False,
     ) -> None:
         super().__init__()
         self.model_name = resolve_image_model_name(model_name)
@@ -315,6 +352,7 @@ class ContrastiveImageGeneModel(nn.Module):
             model_name=self.model_name,
             pretrained=pretrained,
             checkpoint_path=image_encoder_checkpoint,
+            trainable=trainable,
         )
         self.image_projection = ProjectionHead(embedding_dim=image_feature_dim)
 

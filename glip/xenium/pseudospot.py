@@ -23,7 +23,7 @@ from .data import (
     build_target_to_source_index,
     prepare_processed_dataset,
 )
-from glip.utils import assign_position_folds, save_json
+from glip.utils import assign_position_folds, normalize_expression, save_json
 
 Image.MAX_IMAGE_PIXELS = None
 
@@ -450,6 +450,9 @@ class XeniumPseudoSpotDataset(Dataset):
         include_image: bool = True,
         encoder_target_gene_names: Optional[Sequence[str]] = None,
         encoder_use_raw_counts: bool = False,
+        expression_normalization: str = "log1p",
+        cpm_scale: float = 1_000_000.0,
+        model_name: Optional[str] = None,
     ) -> None:
         super().__init__()
         self.paths = build_pseudospot_paths(pseudospot_dir)
@@ -475,6 +478,9 @@ class XeniumPseudoSpotDataset(Dataset):
             else list(self.gene_names)
         )
         self.encoder_use_raw_counts = bool(encoder_use_raw_counts)
+        self.expression_normalization = str(expression_normalization).strip().lower()
+        self.cpm_scale = float(cpm_scale)
+        self.model_name = model_name  # Store model name for normalization
         self._encoder_target_to_source = build_target_to_source_index(self.gene_names, self.encoder_target_gene_names)
         self.image_size = int(image_size)
         self.crop_size_um = (
@@ -551,16 +557,23 @@ class XeniumPseudoSpotDataset(Dataset):
                 image = TF.vflip(image)
             image = TF.rotate(image, float(np.random.choice([0, 90, 180, -90])))
         tensor = TF.to_tensor(image)
-        return TF.normalize(
-            tensor,
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225],
-        )
+
+        # Select normalization parameters based on model
+        if self.model_name and 'h0mini' in str(self.model_name).lower():
+            # H0-mini normalization
+            mean = CFG.H0MINI_MEAN
+            std = CFG.H0MINI_STD
+        else:
+            # ImageNet normalization (default)
+            mean = [0.485, 0.456, 0.406]
+            std = [0.229, 0.224, 0.225]
+
+        return TF.normalize(tensor, mean=mean, std=std)
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
         data_index = int(self.indices[index])
         raw_expression = self.counts[data_index].astype(np.float32, copy=False)
-        expression = np.log1p(raw_expression)
+        expression = normalize_expression(raw_expression, self.expression_normalization, self.cpm_scale)
         encoder_source_expression = raw_expression if self.encoder_use_raw_counts else expression
         encoder_expression = align_expression_from_index_map(
             encoder_source_expression,

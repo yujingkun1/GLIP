@@ -25,11 +25,17 @@ from tqdm import tqdm
 
 from glip.utils import AvgMeter, compute_pearson_metrics, get_lr, parse_bool, save_json, seed_everything
 from glip.visium.dataset import CLIPDataset
-from glip.visium.models import CLIPModel, CLIPModel_CLIP, CLIPModel_UNI, CLIPModel_ViT, CLIPModel_ViT_L, CLIPModel_resnet101, CLIPModel_resnet152
+from glip.visium.models import CLIPModel, CLIPModel_CLIP, CLIPModel_H0mini, CLIPModel_UNI, CLIPModel_ViT, CLIPModel_ViT_L, CLIPModel_resnet101, CLIPModel_resnet152
 from glip.xenium.pseudospot import XeniumPseudoSpotDataset, build_pseudospot_output_dir
 
 UNI_MODEL_NAME = "hf-hub:MahmoodLab/UNI2-h"
-MODEL_NAME_ALIASES = {"uni": UNI_MODEL_NAME, "uni2-h": UNI_MODEL_NAME}
+H0MINI_MODEL_NAME = "hf-hub:bioptimus/H0-mini"
+MODEL_NAME_ALIASES = {
+    "uni": UNI_MODEL_NAME,
+    "uni2-h": UNI_MODEL_NAME,
+    "h0mini": H0MINI_MODEL_NAME,
+    "h0-mini": H0MINI_MODEL_NAME,
+}
 DEFAULT_VISIUM_SAMPLE_IDS = [f"SPA{i}" for i in range(119, 155)]
 DEFAULT_SHARED_GENE_FILE = "/data/yujk/GLIP/configs/brca_shared_genes_ncbi784_visium36_intersection_227.txt"
 
@@ -98,6 +104,8 @@ class RunConfig:
     seed: int
     device: str
     num_workers: int
+    gene_normalization: str
+    cpm_scale: float
     max_visium_train_spots: int
     max_visium_test_spots: int
     max_xenium_train_spots: int
@@ -997,6 +1005,7 @@ def build_model(
     ot_sinkhorn_eps: float = 0.05,
     ot_sinkhorn_iters: int = 50,
     uot_marginal_weight: float = 1.0,
+    trainable: bool = False,
 ):
     choice = str(model_name).strip().lower()
     if choice == "clip":
@@ -1009,6 +1018,14 @@ def build_model(
         base_model = CLIPModel_resnet101(spot_embedding=spot_embedding_dim)
     elif choice == "resnet152":
         base_model = CLIPModel_resnet152(spot_embedding=spot_embedding_dim)
+    elif choice == "h0mini" or choice == "h0-mini" or resolved_model_name == H0MINI_MODEL_NAME:
+        base_model = CLIPModel_H0mini(
+            spot_embedding=spot_embedding_dim,
+            pretrained=pretrained,
+            checkpoint_path=checkpoint_path,
+            output_mode="pooled",  # Use CLS token for spot-level tasks
+            trainable=trainable,  # --trainable flag or default False
+        )
     elif choice == "uni" or resolved_model_name == UNI_MODEL_NAME:
         base_model = CLIPModel_UNI(spot_embedding=spot_embedding_dim, pretrained=pretrained, checkpoint_path=checkpoint_path)
     else:
@@ -1060,7 +1077,10 @@ def build_visium_subsets(args, shared_gene_file: str):
         sample_ids=args.visium_sample_ids,
         gene_file=shared_gene_file,
         max_spots_per_sample=args.max_spots_per_sample,
+        expression_normalization=args.gene_normalization,
+        cpm_scale=args.cpm_scale,
         is_train=False,
+        model_name=args.model,  # Pass model name for normalization
     )
     if args.visium_fold_manifest:
         fold_payload = load_fixed_fold_manifest(args.visium_fold_manifest, args.visium_fold_index)
@@ -1101,10 +1121,13 @@ def build_xenium_datasets(args, shared_gene_file: str):
         num_position_folds=args.xenium_num_position_folds,
         encoder_target_gene_names=shared_genes,
         encoder_use_raw_counts=False,
+        expression_normalization=args.gene_normalization,
+        cpm_scale=args.cpm_scale,
         max_spots=args.max_xenium_train_spots,
         include_image=True,
         augment=True,
         image_size=args.image_size,
+        model_name=args.model,  # Pass model name for normalization
     )
     train_eval_dataset = XeniumPseudoSpotDataset(
         pseudospot_dir=pseudospot_dir,
@@ -1113,10 +1136,13 @@ def build_xenium_datasets(args, shared_gene_file: str):
         num_position_folds=args.xenium_num_position_folds,
         encoder_target_gene_names=shared_genes,
         encoder_use_raw_counts=False,
+        expression_normalization=args.gene_normalization,
+        cpm_scale=args.cpm_scale,
         max_spots=args.max_xenium_train_spots,
         include_image=True,
         augment=False,
         image_size=args.image_size,
+        model_name=args.model,  # Pass model name for normalization
     )
     test_dataset = XeniumPseudoSpotDataset(
         pseudospot_dir=pseudospot_dir,
@@ -1125,10 +1151,13 @@ def build_xenium_datasets(args, shared_gene_file: str):
         num_position_folds=args.xenium_num_position_folds,
         encoder_target_gene_names=shared_genes,
         encoder_use_raw_counts=False,
+        expression_normalization=args.gene_normalization,
+        cpm_scale=args.cpm_scale,
         max_spots=args.max_xenium_test_spots,
         include_image=True,
         augment=False,
         image_size=args.image_size,
+        model_name=args.model,  # Pass model name for normalization
     )
     return train_dataset, train_eval_dataset, test_dataset, shared_genes
 
@@ -1155,12 +1184,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--batch-size', type=int, default=4)
     parser.add_argument('--eval-batch-size', type=int, default=32)
     parser.add_argument('--num-workers', type=int, default=0)
+    parser.add_argument('--gene-normalization', choices=['log1p', 'log1p_cpm'], default='log1p')
+    parser.add_argument('--cpm-scale', type=float, default=1_000_000.0)
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--weight-decay', type=float, default=1e-3)
     parser.add_argument('--top-k', type=int, default=50)
     parser.add_argument('--retrieval-chunk-size', type=int, default=1024)
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--trainable', action='store_true', help='Unfreeze H0-mini parameters for fine-tuning')
     parser.add_argument('--image-size', type=int, default=224)
     parser.add_argument('--max-spots-per-sample', type=int, default=0)
     parser.add_argument('--max-visium-train-spots', type=int, default=0)
@@ -1216,6 +1248,8 @@ def main() -> None:
     args.ot_transport = str(args.ot_transport).strip().lower()
     args.module_gene_completion = parse_bool(args.module_gene_completion)
     args.module_cell_refine = parse_bool(args.module_cell_refine)
+    if args.cpm_scale <= 0:
+        raise ValueError("--cpm-scale must be positive.")
 
     if not args.module_naive_joint:
         raise ValueError("This script is the Stage2 naive joint implementation; --module-naive-joint must remain true.")
@@ -1289,6 +1323,7 @@ def main() -> None:
         ot_sinkhorn_eps=args.ot_sinkhorn_eps,
         ot_sinkhorn_iters=args.ot_sinkhorn_iters,
         uot_marginal_weight=args.uot_marginal_weight,
+        trainable=args.trainable,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
@@ -1318,6 +1353,8 @@ def main() -> None:
         seed=args.seed,
         device=str(device),
         num_workers=args.num_workers,
+        gene_normalization=args.gene_normalization,
+        cpm_scale=args.cpm_scale,
         max_visium_train_spots=args.max_visium_train_spots,
         max_visium_test_spots=args.max_visium_test_spots,
         max_xenium_train_spots=args.max_xenium_train_spots,
@@ -1366,6 +1403,8 @@ def main() -> None:
         'visium_test_spots': len(vis_test),
         'xenium_train_spots': len(xen_train),
         'xenium_test_spots': len(xen_test),
+        'gene_normalization': args.gene_normalization,
+        'cpm_scale': float(args.cpm_scale),
         'eval_bank_mode': args.eval_bank_mode,
         'module_toggles': {
             'naive_joint': args.module_naive_joint,

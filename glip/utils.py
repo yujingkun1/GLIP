@@ -138,3 +138,16 @@ def sample_indices(total_size: int, max_items: int, seed: int) -> np.ndarray:
         return np.arange(total_size, dtype=np.int64)
     rng = np.random.default_rng(seed)
     return np.sort(rng.choice(total_size, size=max_items, replace=False).astype(np.int64))
+
+
+def normalize_expression(raw_expression, normalization: str = "log1p", cpm_scale: float = 1_000_000.0) -> np.ndarray:
+    raw_expression = np.clip(np.asarray(raw_expression, dtype=np.float32), a_min=0.0, a_max=None)
+    normalization = str(normalization).strip().lower()
+    if normalization == "log1p":
+        return np.log1p(raw_expression).astype(np.float32, copy=False)
+    if normalization == "log1p_cpm":
+        total = float(raw_expression.sum())
+        if total <= 0.0:
+            return np.zeros_like(raw_expression, dtype=np.float32)
+        return np.log1p(raw_expression / total * float(cpm_scale)).astype(np.float32, copy=False)
+    raise ValueError(f"Unsupported expression normalization: {normalization}")

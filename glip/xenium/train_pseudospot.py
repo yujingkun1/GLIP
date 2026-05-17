@@ -247,6 +247,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-fold", type=int, default=4, help="Held-out x-position fold id")
     parser.add_argument("--num-position-folds", type=int, default=5, help="Number of contiguous x-position folds")
     parser.add_argument("--top-k", type=int, default=1, help="Top-k neighbors for retrieval-based expression prediction")
+    parser.add_argument("--trainable", action="store_true", help="Unfreeze H0-mini parameters for fine-tuning")
     parser.add_argument("--retrieval-chunk-size", type=int, default=1024, help="Chunk size for retrieval similarity")
     parser.add_argument(
         "--epoch-eval-max-spots",
@@ -436,6 +437,7 @@ def main() -> None:
         scfoundation_key=args.scfoundation_key,
         scfoundation_pool_type=args.scfoundation_pool_type,
         scfoundation_tgthighres=args.scfoundation_tgthighres,
+        trainable=args.trainable,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 

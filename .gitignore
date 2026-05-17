@@ -1,13 +1,85 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Model checkpoints
 *.pt
-*.pyc
-*.pyo
-*.pyd
+*.pth
+*.ckpt
+*.onnx
+
+# Data files (large / generated)
 *.npy
-*.png
-*.json
-*.csv
-*.svs
-*.tif
-*.tsv
+*.npz
+*.h5
+*.h5ad
+*.parquet
+*.feather
 *.pkl
 *.gz
+*.tar
+*.tar.gz
+
+# Image / slide files
+*.png
+*.jpg
+*.jpeg
+*.svs
+*.tif
+*.tiff
+
+# Tables
+*.csv
+*.tsv
+*.json
+
+# Logs
+*.log
+logs/
+
+# Experiment outputs
+runs/
+runs_joint/
+runs_visium/
+runs_xenium/
+experiments/
+pseudospot_output/
+stage2/
+output/
+outputs/
+checkpoints/
+lightning_logs/
+
+# Processed / intermediate data
+processed/
+
+# Weights & Biases
+wandb/
+
+# Environment
+.env
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# omx workspace
+.omx/

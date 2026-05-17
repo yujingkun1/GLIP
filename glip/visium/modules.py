@@ -276,7 +276,74 @@ class ImageEncoder_UNI(ImageEncoder):
             trainable=trainable,
             checkpoint_path=checkpoint_path,
         )
-    
+
+
+class ImageEncoder_H0mini(nn.Module):
+    """
+    Encode images with Bioptimus H0-mini (ViT-Base/14 pretrained on 43M histology tiles).
+    Supports two output modes:
+    - 'pooled': CLS token (batch_size, 768) for spot-level tasks
+    - 'patch_tokens': 256 patch tokens (batch_size, 256, 768) for cell-level tasks
+    """
+
+    def __init__(
+        self,
+        pretrained=True,
+        trainable=False,  # Default: freeze parameters
+        checkpoint_path=CFG.H0MINI_CHECKPOINT,
+        output_mode="pooled",  # 'pooled' or 'patch_tokens'
+    ):
+        super().__init__()
+        self.output_mode = output_mode
+        self.model_name = "h0mini"
+
+        # Load H0-mini model from local directory
+        # H0-mini uses SwiGLU activation with mlp_ratio=5.33334
+        self.model = timm.create_model(
+            "vit_base_patch14_reg4_dinov2",
+            pretrained=False,
+            num_classes=0,
+            img_size=224,
+            reg_tokens=4,
+            dynamic_img_size=True,
+            mlp_ratio=5.33334,  # H0-mini specific
+            mlp_layer=timm.layers.SwiGLUPacked,
+            act_layer=torch.nn.SiLU,
+        )
+
+        # Load local checkpoint
+        if pretrained and checkpoint_path:
+            state_dict = torch.load(checkpoint_path, map_location="cpu")
+            # Handle different checkpoint formats
+            if isinstance(state_dict, dict) and "state_dict" in state_dict:
+                state_dict = state_dict["state_dict"]
+            self.model.load_state_dict(state_dict, strict=True)
+
+        # Set output dimension
+        if output_mode == "pooled":
+            self.output_dim = 768  # CLS token
+        elif output_mode == "patch_tokens":
+            self.output_dim = 768  # Each patch token dimension
+        else:
+            raise ValueError(f"Invalid output_mode: {output_mode}. Must be 'pooled' or 'patch_tokens'")
+
+        # Set trainability (default: frozen)
+        for p in self.model.parameters():
+            p.requires_grad = trainable
+
+    def forward(self, x):
+        # x: (batch_size, 3, 224, 224)
+        # Use forward_features to get all tokens
+        output = self.model.forward_features(x)  # (batch_size, 261, 768)
+        # 261 tokens = 1 CLS + 4 reg + 256 patch tokens
+
+        if self.output_mode == "pooled":
+            return output[:, 0]  # CLS token: (batch_size, 768)
+        elif self.output_mode == "patch_tokens":
+            # Skip CLS and reg tokens, return only patch tokens
+            num_prefix = self.model.num_prefix_tokens  # 5 (1 CLS + 4 reg)
+            return output[:, num_prefix:]  # (batch_size, 256, 768)
+
 
 #  'vit_base_patch32_224',
 #  'vit_base_patch32_224_clip_laion2b',

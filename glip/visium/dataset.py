@@ -9,6 +9,9 @@ import torch
 import torchvision.transforms.functional as TF
 from PIL import Image
 
+from glip.utils import normalize_expression
+from . import config as CFG
+
 
 def _decode_barcode(value):
     current = value
@@ -80,15 +83,21 @@ class CLIPDataset(torch.utils.data.Dataset):
         sample_ids=None,
         gene_file=None,
         max_spots_per_sample=None,
+        expression_normalization="log1p",
+        cpm_scale=1_000_000.0,
         is_train=False,
+        model_name=None,
     ):
         self.is_train = is_train
         self.mode = "legacy" if hest_data_dir is None else "hest"
+        self.expression_normalization = str(expression_normalization).strip().lower()
+        self.cpm_scale = float(cpm_scale)
         self.num_features = 0
         self.num_genes = 0
         self.selected_genes = []
         self._adata_cache = {}
         self._patch_cache = {}
+        self.model_name = model_name  # Store model name for normalization
 
         if self.mode == "legacy":
             self._init_legacy_dataset(
@@ -126,6 +135,14 @@ class CLIPDataset(torch.utils.data.Dataset):
         self.spatial_pos_csv = pd.read_csv(self.spatial_pos_path, sep=",", header=None)
         self.barcode_tsv = pd.read_csv(self.barcode_path, sep="\t", header=None)
         self.reduced_matrix = np.load(self.reduced_mtx_path).T.astype(np.float32)
+        if self.expression_normalization != "log1p":
+            self.reduced_matrix = np.stack(
+                [
+                    normalize_expression(row, self.expression_normalization, self.cpm_scale)
+                    for row in self.reduced_matrix
+                ],
+                axis=0,
+            ).astype(np.float32, copy=False)
         self.num_features = self.reduced_matrix.shape[1]
         self.num_genes = self.num_features
 
@@ -304,7 +321,18 @@ class CLIPDataset(torch.utils.data.Dataset):
             image = TF.rotate(image, random.choice([180, 90, 0, -90]))
 
         image = TF.to_tensor(image)
-        image = TF.normalize(image, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+
+        # Select normalization parameters based on model
+        if self.model_name and 'h0mini' in str(self.model_name).lower():
+            # H0-mini normalization
+            mean = CFG.H0MINI_MEAN
+            std = CFG.H0MINI_STD
+        else:
+            # ImageNet normalization (default for other models)
+            mean = CFG.IMAGENET_MEAN
+            std = CFG.IMAGENET_STD
+
+        image = TF.normalize(image, mean=mean, std=std)
         return image
 
     def get_item(self, idx, is_train=None):
@@ -348,7 +376,7 @@ class CLIPDataset(torch.utils.data.Dataset):
             expression_row = np.asarray(expression_row).reshape(-1).astype(np.float32)
             gene_expression[sorted_gene_positions] = expression_row
 
-        gene_expression = np.log1p(np.clip(gene_expression, a_min=0.0, a_max=None))
+        gene_expression = normalize_expression(gene_expression, self.expression_normalization, self.cpm_scale)
 
         return {
             "image": image.float(),

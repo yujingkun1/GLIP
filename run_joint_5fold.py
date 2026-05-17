@@ -53,6 +53,8 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--eval-batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--gene-normalization", choices=["log1p", "log1p_cpm"], default="log1p")
+    parser.add_argument("--cpm-scale", type=float, default=1_000_000.0)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-3)
@@ -132,6 +134,10 @@ def main() -> None:
             str(args.eval_batch_size),
             "--num-workers",
             str(args.num_workers),
+            "--gene-normalization",
+            args.gene_normalization,
+            "--cpm-scale",
+            str(args.cpm_scale),
             "--epochs",
             str(args.epochs),
             "--lr",
